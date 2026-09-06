@@ -1575,6 +1575,8 @@ impl TrackRuntime {
     pub(crate) fn output_params(&self) -> &CodecParameters {
         if let Some(enc) = &self.encoder {
             enc.output_params()
+        } else if let Some(dec) = &self.decoder {
+            dec.output_params().unwrap_or(&self.input_params)
         } else {
             &self.input_params
         }
