@@ -36,8 +36,8 @@ pub use sinks::{FileSink, NullSink};
 pub use staged::{BarrierKind, ChannelCaps, Progress, SeekCmd};
 
 use oxideav_core::{
-    CodecParameters, CodecRegistry, Decoder, Demuxer, Encoder, Error, Frame, MediaType, Muxer,
-    Packet, Result, StreamInfo, TimeBase,
+    CodecParameters, CodecRegistry, Decoder, Demuxer, Encoder, Error, Frame, FrameLease, MediaType,
+    Muxer, Packet, Result, StreamInfo, TimeBase,
 };
 
 // ───────────────────────── Sink trait ─────────────────────────
@@ -75,6 +75,14 @@ pub trait Sink: Send {
 
     /// Decoded/transcoded path: receive a decoded frame.
     fn write_frame(&mut self, frame: &Frame) -> Result<()>;
+
+    /// Receive an owned decoded-frame lease without copying its backing
+    /// storage. The default adapter materialises only for legacy sinks that
+    /// implement [`Self::write_frame`] alone.
+    fn write_frame_lease(&mut self, lease: FrameLease) -> Result<()> {
+        let frame = lease.into_frame()?;
+        self.write_frame(&frame)
+    }
 
     /// Called once after all data has been sent through this sink.
     fn flush(&mut self) -> Result<()>;
@@ -299,10 +307,10 @@ fn drain_decoder_to_sink(
     stats: &mut PipelineStats,
 ) -> Result<()> {
     loop {
-        match decoder.receive_frame() {
+        match decoder.receive_frame_lease() {
             Ok(frame) => {
                 stats.frames_decoded += 1;
-                sink.write_frame(&frame)?;
+                sink.write_frame_lease(frame)?;
             }
             Err(Error::NeedMore) | Err(Error::Eof) => return Ok(()),
             Err(e) => return Err(e),
@@ -317,9 +325,10 @@ fn drain_transcode_to_sink(
     stats: &mut PipelineStats,
 ) -> Result<()> {
     loop {
-        match decoder.receive_frame() {
-            Ok(frame) => {
+        match decoder.receive_frame_lease() {
+            Ok(lease) => {
                 stats.frames_decoded += 1;
+                let frame = lease.into_frame()?;
                 encoder.send_frame(&frame)?;
                 drain_encoder_to_sink(encoder, sink, stats)?;
             }

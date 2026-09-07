@@ -22,7 +22,7 @@ use std::path::PathBuf;
 
 use oxideav_core::{
     CodecId, CodecParameters, CodecRegistry, Decoder, Demuxer, Encoder, Error, ExecutionContext,
-    FilterContext, FilterRegistry, Frame, FrameSource, MediaType, Packet, PacketSource,
+    FilterContext, FilterRegistry, Frame, FrameLease, FrameSource, MediaType, Packet, PacketSource,
     PixelFormat, PortParams, PortSpec, Rational, ReadSeek, Result, RuntimeContext, SampleFormat,
     SourceOutput, StreamFilter, StreamInfo, TimeBase,
 };
@@ -130,6 +130,17 @@ pub trait JobSink {
     fn start(&mut self, streams: &[StreamInfo]) -> Result<()>;
     fn write_packet(&mut self, kind: MediaType, pkt: &Packet) -> Result<()>;
     fn write_frame(&mut self, kind: MediaType, frm: &Frame) -> Result<()>;
+
+    /// Receive an owned decoded-frame lease without copying its backing
+    /// storage. Player-style sinks should override this method and retain or
+    /// forward the lease directly.
+    ///
+    /// The default adapter preserves source compatibility for existing sinks by
+    /// materialising the lease only at this legacy `&Frame` boundary.
+    fn write_frame_lease(&mut self, kind: MediaType, lease: FrameLease) -> Result<()> {
+        let frame = lease.into_frame()?;
+        self.write_frame(kind, &frame)
+    }
     /// Drain any remaining internal state and finalise the output.
     fn finish(&mut self) -> Result<()>;
 
@@ -1596,7 +1607,7 @@ impl TrackRuntime {
         sink: &mut dyn JobSink,
         stats: &mut ExecutorStats,
     ) -> StageResult<()> {
-        self.pump_frame(frame, track_index, sink, stats)
+        self.pump_frame(FrameLease::from_frame(frame), track_index, sink, stats)
     }
 
     fn feed_packet(
@@ -1640,7 +1651,7 @@ impl TrackRuntime {
             }
             let mut produced_any = false;
             loop {
-                let frame = match self.decoder.as_mut().unwrap().receive_frame() {
+                let frame = match self.decoder.as_mut().unwrap().receive_frame_lease() {
                     Ok(f) => f,
                     Err(Error::NeedMore) | Err(Error::Eof) => break,
                     Err(e) => {
@@ -1671,23 +1682,37 @@ impl TrackRuntime {
 
     fn pump_frame(
         &mut self,
-        frame: Frame,
+        frame: FrameLease,
         track_index: u32,
         sink: &mut dyn JobSink,
         stats: &mut ExecutorStats,
     ) -> StageResult<()> {
         let sinkf = attribute(FailureStage::Sink, Some(track_index));
         let encf = attribute(FailureStage::Encode, Some(track_index));
-        let mut frames: Vec<Frame> = vec![frame];
+
+        // The direct player path preserves the decoder's native storage all the
+        // way to the sink. No CPU arena copy and no hardware-surface readback.
+        if self.frame_stages.is_empty() && self.encoder.is_none() {
+            sink.write_frame_lease(self.kind, frame).map_err(&sinkf)?;
+            stats.frames_written += 1;
+            return Ok(());
+        }
+
+        // Filters and encoders still consume the legacy Frame API. Materialise
+        // exactly once at that explicit compatibility boundary.
+        let convertf = attribute(FailureStage::Convert, Some(track_index));
+        let mut frames: Vec<Frame> = vec![frame.into_frame().map_err(&convertf)?];
         for stage in &mut self.frame_stages {
             let stagef = attribute(frame_stage_failure_kind(stage), Some(track_index));
             let mut next = Vec::new();
             for f in frames {
                 let produced = run_frame_stage_emit(stage, f).map_err(&stagef)?;
                 // Extras (multi-port filter emissions) go straight to the
-                // sink as auto-attached streams.
+                // sink as auto-attached streams. Wrap them in a lease so an
+                // asynchronous sink need not clone their media buffers.
                 for (kind, frm) in produced.extras {
-                    sink.write_frame(kind, &frm).map_err(&sinkf)?;
+                    sink.write_frame_lease(kind, FrameLease::from_frame(frm))
+                        .map_err(&sinkf)?;
                     stats.frames_written += 1;
                 }
                 next.extend(produced.primary);
@@ -1711,9 +1736,11 @@ impl TrackRuntime {
                 }
             }
         } else {
-            // Raw frame to sink (player sink consumes this).
+            // Frame stages produced fresh owned frames. Preserve ownership into
+            // a player sink rather than borrowing and forcing it to clone.
             for f in frames {
-                sink.write_frame(self.kind, &f).map_err(&sinkf)?;
+                sink.write_frame_lease(self.kind, FrameLease::from_frame(f))
+                    .map_err(&sinkf)?;
                 stats.frames_written += 1;
             }
         }
@@ -1743,7 +1770,7 @@ impl TrackRuntime {
                 }
             }
             loop {
-                let frame = match self.decoder.as_mut().unwrap().receive_frame() {
+                let frame = match self.decoder.as_mut().unwrap().receive_frame_lease() {
                     Ok(f) => f,
                     Err(Error::NeedMore) | Err(Error::Eof) => break,
                     Err(e) => {
@@ -1772,7 +1799,8 @@ impl TrackRuntime {
             let flushed = flush_frame_stage_emit(&mut self.frame_stages[i]).map_err(&stagef)?;
             // Extras from a flushing filter go straight to the sink.
             for (kind, frm) in flushed.extras {
-                sink.write_frame(kind, &frm).map_err(&sinkf)?;
+                sink.write_frame_lease(kind, FrameLease::from_frame(frm))
+                    .map_err(&sinkf)?;
                 stats.frames_written += 1;
             }
             let mut primary = flushed.primary;
@@ -1788,7 +1816,8 @@ impl TrackRuntime {
                     let produced =
                         run_frame_stage_emit(&mut self.frame_stages[j], f).map_err(&stagef)?;
                     for (kind, frm) in produced.extras {
-                        sink.write_frame(kind, &frm).map_err(&sinkf)?;
+                        sink.write_frame_lease(kind, FrameLease::from_frame(frm))
+                            .map_err(&sinkf)?;
                         stats.frames_written += 1;
                     }
                     next.extend(produced.primary);
@@ -1826,7 +1855,8 @@ impl TrackRuntime {
             }
         } else {
             for f in tail {
-                sink.write_frame(self.kind, &f).map_err(&sinkf)?;
+                sink.write_frame_lease(self.kind, FrameLease::from_frame(f))
+                    .map_err(&sinkf)?;
                 stats.frames_written += 1;
             }
         }
@@ -2458,6 +2488,159 @@ mod tests {
             Some("mkv")
         );
         assert_eq!(ext_from_uri("/no/ext"), None);
+    }
+
+    use std::any::Any;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use oxideav_core::{HardwareVideoFrame, HardwareVideoFrameStorage, VideoFrame, VideoPlane};
+
+    struct CountingHardwareStorage {
+        materializations: Arc<AtomicUsize>,
+    }
+
+    impl HardwareVideoFrameStorage for CountingHardwareStorage {
+        fn backend(&self) -> &'static str {
+            "test-hw"
+        }
+
+        fn width(&self) -> u32 {
+            2
+        }
+
+        fn height(&self) -> u32 {
+            2
+        }
+
+        fn pixel_format(&self) -> PixelFormat {
+            PixelFormat::Yuv420P
+        }
+
+        fn pts(&self) -> Option<i64> {
+            Some(7)
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn materialize(&self) -> Result<VideoFrame> {
+            self.materializations.fetch_add(1, Ordering::SeqCst);
+            Ok(VideoFrame {
+                pts: Some(7),
+                planes: vec![
+                    VideoPlane {
+                        stride: 2,
+                        data: vec![16, 32, 48, 64],
+                    },
+                    VideoPlane {
+                        stride: 1,
+                        data: vec![128],
+                    },
+                    VideoPlane {
+                        stride: 1,
+                        data: vec![128],
+                    },
+                ],
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct LeaseObservingSink {
+        hardware_writes: usize,
+        owned_writes: usize,
+        legacy_writes: usize,
+    }
+
+    impl JobSink for LeaseObservingSink {
+        fn start(&mut self, _streams: &[StreamInfo]) -> Result<()> {
+            Ok(())
+        }
+
+        fn write_packet(&mut self, _kind: MediaType, _pkt: &Packet) -> Result<()> {
+            Ok(())
+        }
+
+        fn write_frame(&mut self, _kind: MediaType, _frm: &Frame) -> Result<()> {
+            self.legacy_writes += 1;
+            Ok(())
+        }
+
+        fn write_frame_lease(&mut self, _kind: MediaType, lease: FrameLease) -> Result<()> {
+            if lease.is_hardware_video() {
+                self.hardware_writes += 1;
+            }
+            if lease.as_frame().is_some() {
+                self.owned_writes += 1;
+            }
+            Ok(())
+        }
+
+        fn finish(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn test_hardware_lease(materializations: Arc<AtomicUsize>) -> FrameLease {
+        FrameLease::from_hardware_video(HardwareVideoFrame::new(CountingHardwareStorage {
+            materializations,
+        }))
+    }
+
+    #[test]
+    fn direct_player_path_preserves_hardware_lease_without_materializing() {
+        let materializations = Arc::new(AtomicUsize::new(0));
+        let lease = test_hardware_lease(Arc::clone(&materializations));
+        let mut track = TrackRuntime::new(
+            "test://video".to_string(),
+            ResolvedSelector::any(),
+            MediaType::Video,
+            false,
+            Vec::new(),
+        );
+        let mut sink = LeaseObservingSink::default();
+        let mut stats = ExecutorStats::default();
+
+        track
+            .pump_frame(lease, 0, &mut sink, &mut stats)
+            .expect("direct frame lease must reach the sink");
+
+        assert_eq!(materializations.load(Ordering::SeqCst), 0);
+        assert_eq!(sink.hardware_writes, 1);
+        assert_eq!(sink.owned_writes, 0);
+        assert_eq!(sink.legacy_writes, 0);
+        assert_eq!(stats.frames_written, 1);
+    }
+
+    #[test]
+    fn legacy_frame_stage_materializes_hardware_lease_once() {
+        let materializations = Arc::new(AtomicUsize::new(0));
+        let lease = test_hardware_lease(Arc::clone(&materializations));
+        let mut track = TrackRuntime::new(
+            "test://video".to_string(),
+            ResolvedSelector::any(),
+            MediaType::Video,
+            false,
+            Vec::new(),
+        );
+        track.frame_stages.push(FrameStage::PixConvert {
+            src_info: oxideav_pixfmt::FrameInfo::new(PixelFormat::Yuv420P, 2, 2),
+            target: PixelFormat::Rgba,
+        });
+        let mut sink = LeaseObservingSink::default();
+        let mut stats = ExecutorStats::default();
+
+        track
+            .pump_frame(lease, 0, &mut sink, &mut stats)
+            .expect("hardware lease should materialize at the legacy frame stage");
+
+        assert_eq!(materializations.load(Ordering::SeqCst), 1);
+        assert_eq!(sink.hardware_writes, 0);
+        assert_eq!(sink.owned_writes, 1);
+        assert_eq!(sink.legacy_writes, 0);
+        assert_eq!(stats.frames_written, 1);
     }
 
     // Legacy `build_video_filter` / `build_audio_filter` unit tests

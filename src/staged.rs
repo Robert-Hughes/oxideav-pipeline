@@ -39,7 +39,8 @@ use std::time::{Duration, Instant};
 use oxideav_core::Demuxer;
 use oxideav_core::{Decoder, Encoder};
 use oxideav_core::{
-    Error, Frame, FrameSource, MediaType, Packet, PacketSource, Result, StreamInfo, TimeBase,
+    Error, Frame, FrameLease, FrameSource, MediaType, Packet, PacketSource, Result, StreamInfo,
+    TimeBase,
 };
 
 use crate::executor::{
@@ -533,7 +534,7 @@ struct OutputItem {
 
 enum OutputPayload {
     Packet(Packet),
-    Frame(Frame),
+    Frame(FrameLease),
 }
 
 /// Optional control bundle for [`run_pipelined`]. `seek_rx` is consumed
@@ -666,7 +667,7 @@ pub(crate) fn run_pipelined_inner(
     // synthetic stream, so no per-stream index is needed).
     type Route = (u32, SyncSender<Msg<Packet>>);
     let mut routes_by_uri: HashMap<String, Vec<Route>> = HashMap::new();
-    let mut frame_routes_by_uri: HashMap<String, Vec<SyncSender<Msg<Frame>>>> = HashMap::new();
+    let mut frame_routes_by_uri: HashMap<String, Vec<SyncSender<Msg<FrameLease>>>> = HashMap::new();
 
     // Build + spawn each track's stage chain. We consume the Vec so the
     // decoder/encoder/filters can be moved into worker threads.
@@ -684,7 +685,7 @@ pub(crate) fn run_pipelined_inner(
         // (Demuxer / Packets) wire a packet channel + a copy or decode
         // stage in front; frame-shape sources feed the chain directly
         // from the frame-pump thread.
-        let frame_head_rx: Receiver<Msg<Frame>> = if source_is_frames {
+        let frame_head_rx: Receiver<Msg<FrameLease>> = if source_is_frames {
             if pl.copy {
                 // Structural setup error — no data has flowed yet.
                 return Err(fail_sink(
@@ -703,7 +704,7 @@ pub(crate) fn run_pipelined_inner(
                 pl.decoder.is_none(),
                 "frame-shape track should not have instantiated a decoder"
             );
-            let (frame0_tx, frame0_rx) = mpsc::sync_channel::<Msg<Frame>>(frame_cap);
+            let (frame0_tx, frame0_rx) = mpsc::sync_channel::<Msg<FrameLease>>(frame_cap);
             frame_routes_by_uri
                 .entry(source_uri)
                 .or_default()
@@ -764,7 +765,7 @@ pub(crate) fn run_pipelined_inner(
                     ));
                 }
             };
-            let (frame0_tx, frame0_rx) = mpsc::sync_channel::<Msg<Frame>>(frame_cap);
+            let (frame0_tx, frame0_rx) = mpsc::sync_channel::<Msg<FrameLease>>(frame_cap);
             let abort_d = abort.clone();
             let counters_d = counters.clone();
             let budget_d = budget.clone();
@@ -793,9 +794,9 @@ pub(crate) fn run_pipelined_inner(
         let extra_port_counts: Vec<u32> = pl.extra_output_port_counts.clone().into_iter().collect();
         let mut extra_counts_iter = extra_port_counts.into_iter();
 
-        let mut upstream: Receiver<Msg<Frame>> = frame_head_rx;
+        let mut upstream: Receiver<Msg<FrameLease>> = frame_head_rx;
         for (fidx, stage) in frame_stages.into_iter().enumerate() {
-            let (ftx, frx) = mpsc::sync_channel::<Msg<Frame>>(frame_cap);
+            let (ftx, frx) = mpsc::sync_channel::<Msg<FrameLease>>(frame_cap);
             let stage_kind = frame_stage_failure_kind(&stage);
             let label = match &stage {
                 FrameStage::Filter(_) => "filter",
@@ -905,7 +906,12 @@ pub(crate) fn run_pipelined_inner(
     // drops the forwards. When the OWNER hits EOF the whole seek
     // surface winds down with it — identical to the historical
     // single-receiver lifetime.
-    type RoutedSource = (String, SourcePump, Vec<Route>, Vec<SyncSender<Msg<Frame>>>);
+    type RoutedSource = (
+        String,
+        SourcePump,
+        Vec<Route>,
+        Vec<SyncSender<Msg<FrameLease>>>,
+    );
     let mut routed: Vec<RoutedSource> = Vec::new();
     for (uri, pump) in sources_by_uri {
         let pkt_routes = routes_by_uri.remove(&uri).unwrap_or_default();
@@ -1038,11 +1044,7 @@ pub(crate) fn run_pipelined_inner(
                     made_progress = true;
                     let pts = match &item.payload {
                         OutputPayload::Packet(p) => p.pts,
-                        OutputPayload::Frame(f) => match f {
-                            Frame::Audio(a) => a.pts,
-                            Frame::Video(v) => v.pts,
-                            _ => None,
-                        },
+                        OutputPayload::Frame(f) => f.pts(),
                     };
                     match item.payload {
                         OutputPayload::Packet(mut p) => {
@@ -1057,7 +1059,7 @@ pub(crate) fn run_pipelined_inner(
                             }
                         }
                         OutputPayload::Frame(f) => {
-                            if let Err(e) = sink.write_frame(item.kind, &f) {
+                            if let Err(e) = sink.write_frame_lease(item.kind, f) {
                                 abort.record_failure(StageFailure::new(
                                     FailureStage::Sink,
                                     Some(item.track_index),
@@ -1491,7 +1493,7 @@ fn run_packet_source_stage(
 /// command's generation (see [`run_packet_source_stage`]).
 fn run_frame_source_stage(
     mut src: Box<dyn FrameSource>,
-    routes: Vec<SyncSender<Msg<Frame>>>,
+    routes: Vec<SyncSender<Msg<FrameLease>>>,
     abort: Arc<AbortState>,
     counters: Arc<PipelineCounters>,
     seek_rx: Option<Receiver<SeekCmd>>,
@@ -1523,8 +1525,9 @@ fn run_frame_source_stage(
         match src.next_frame() {
             Ok(frame) => {
                 counters.frames_decoded.fetch_add(1, Ordering::SeqCst);
+                let lease = FrameLease::from_frame(frame);
                 for tx in &routes {
-                    if tx.send(Msg::Data(frame.clone())).is_err() {
+                    if tx.send(Msg::Data(lease.clone())).is_err() {
                         abort.abort.store(true, Ordering::SeqCst);
                         break;
                     }
@@ -1590,7 +1593,7 @@ fn run_copy_stage(
 fn run_decode_stage(
     mut decoder: Box<dyn Decoder>,
     rx: Receiver<Msg<Packet>>,
-    tx: SyncSender<Msg<Frame>>,
+    tx: SyncSender<Msg<FrameLease>>,
     abort: Arc<AbortState>,
     counters: Arc<PipelineCounters>,
     budget: Arc<QueueBudget>,
@@ -1645,7 +1648,7 @@ fn run_decode_stage(
                     if abort.is_aborted() {
                         break 'outer;
                     }
-                    match decoder.receive_frame() {
+                    match decoder.receive_frame_lease() {
                         Ok(frame) => {
                             counters.frames_decoded.fetch_add(1, Ordering::SeqCst);
                             produced_any = true;
@@ -1711,7 +1714,7 @@ fn run_decode_stage(
                     if abort.is_aborted() {
                         break 'outer;
                     }
-                    match decoder.receive_frame() {
+                    match decoder.receive_frame_lease() {
                         Ok(frame) => {
                             counters.frames_decoded.fetch_add(1, Ordering::SeqCst);
                             if tx.send(Msg::Data(frame)).is_err() {
@@ -1744,8 +1747,8 @@ fn run_decode_stage(
 /// the frame-stage chain and land on the sink directly.
 fn run_frame_stage_worker(
     mut stage: FrameStage,
-    rx: Receiver<Msg<Frame>>,
-    tx: SyncSender<Msg<Frame>>,
+    rx: Receiver<Msg<FrameLease>>,
+    tx: SyncSender<Msg<FrameLease>>,
     extras_tx: Option<SyncSender<Msg<OutputItem>>>,
     extras_base: u32,
     abort: Arc<AbortState>,
@@ -1755,11 +1758,14 @@ fn run_frame_stage_worker(
             break;
         }
         match rx.recv() {
-            Ok(Msg::Data(frame)) => {
+            Ok(Msg::Data(lease)) => {
+                // Filters and pixel conversion still use the legacy Frame API;
+                // materialise precisely when the lease enters such a stage.
+                let frame = lease.into_frame()?;
                 let emissions = run_frame_stage_emit(&mut stage, frame)?;
-                dispatch_extras(&emissions, &extras_tx, extras_base, &abort);
-                for o in emissions.primary {
-                    if tx.send(Msg::Data(o)).is_err() {
+                dispatch_extras(emissions.extras, &extras_tx, extras_base, &abort);
+                for frame in emissions.primary {
+                    if tx.send(Msg::Data(FrameLease::from_frame(frame))).is_err() {
                         abort.abort.store(true, Ordering::SeqCst);
                         break;
                     }
@@ -1788,9 +1794,9 @@ fn run_frame_stage_worker(
             }
             Ok(Msg::Eof) => {
                 let emissions = flush_frame_stage_emit(&mut stage)?;
-                dispatch_extras(&emissions, &extras_tx, extras_base, &abort);
-                for o in emissions.primary {
-                    let _ = tx.send(Msg::Data(o));
+                dispatch_extras(emissions.extras, &extras_tx, extras_base, &abort);
+                for frame in emissions.primary {
+                    let _ = tx.send(Msg::Data(FrameLease::from_frame(frame)));
                 }
                 break;
             }
@@ -1813,11 +1819,11 @@ fn reset_frame_stage(stage: &mut FrameStage) {
     }
 }
 
-/// Push `emissions.extras` onto the sink's output channel (if present).
+/// Push extra filter emissions onto the sink's output channel (if present).
 /// Extras are tagged with indices starting at `extras_base`; port 1
 /// becomes `extras_base`, port 2 `extras_base + 1`, etc.
 fn dispatch_extras(
-    emissions: &crate::executor::FilterEmissions,
+    extras: Vec<(MediaType, Frame)>,
     extras_tx: &Option<SyncSender<Msg<OutputItem>>>,
     extras_base: u32,
     abort: &Arc<AbortState>,
@@ -1831,11 +1837,11 @@ fn dispatch_extras(
     // tuple alone, so we tag every extra with `extras_base` + its
     // media-kind slot. For the single-extra-port case (spectrogram)
     // this is equivalent to `extras_base`.
-    for (kind, frm) in &emissions.extras {
+    for (kind, frame) in extras {
         let item = OutputItem {
             track_index: extras_base,
-            kind: *kind,
-            payload: OutputPayload::Frame(frm.clone()),
+            kind,
+            payload: OutputPayload::Frame(FrameLease::from_frame(frame)),
         };
         if tx.send(Msg::Data(item)).is_err() {
             abort.abort.store(true, Ordering::SeqCst);
@@ -1847,7 +1853,7 @@ fn dispatch_extras(
 /// Encoder stage: frames -> packets -> OutputItem.
 fn run_encode_stage(
     mut encoder: Box<dyn Encoder>,
-    rx: Receiver<Msg<Frame>>,
+    rx: Receiver<Msg<FrameLease>>,
     out_tx: SyncSender<Msg<OutputItem>>,
     track_index: u32,
     kind: MediaType,
@@ -1859,7 +1865,8 @@ fn run_encode_stage(
             break;
         }
         match rx.recv() {
-            Ok(Msg::Data(frame)) => {
+            Ok(Msg::Data(lease)) => {
+                let frame = lease.into_frame()?;
                 encoder.send_frame(&frame)?;
                 drain_and_send(encoder.as_mut(), &out_tx, track_index, kind, &counters)?;
             }
@@ -1895,7 +1902,7 @@ fn run_encode_stage(
 /// Frame fan-out (no encoder): just forwards raw frames to the mux /
 /// sink. Used when the output sink is something like the SDL2 player.
 fn run_frame_fanout(
-    rx: Receiver<Msg<Frame>>,
+    rx: Receiver<Msg<FrameLease>>,
     out_tx: SyncSender<Msg<OutputItem>>,
     track_index: u32,
     kind: MediaType,
