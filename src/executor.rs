@@ -31,7 +31,7 @@ use oxideav_pixfmt::{convert as pixfmt_convert, ConvertOptions};
 use crate::dag::{codec_accepted_pixel_formats, Dag, DagNode, MuxTrack, ResolvedSelector};
 use crate::failure::{attribute, FailureStage, RunFailure, StageFailure, StageResult};
 use crate::schema::{is_reserved_sink, Job};
-use crate::selection::{make_decoder, make_encoder};
+use crate::selection::{make_decoder_with, make_encoder_with, CodecPreferences};
 use crate::sinks::{open_file_write, FileSink, NullSink};
 use crate::staged;
 
@@ -217,6 +217,9 @@ pub struct Executor<'a> {
     /// closure to bridge `(source_uri, backend_name, opts_json)` to a
     /// concrete `Box<dyn FrameSource>`.
     render_source_factory: Option<RenderSourceFactory>,
+    /// Codec implementation preferences applied when decode/encode stages are instantiated.
+    /// Defaults to unconstrained selection.
+    codec_preferences: CodecPreferences,
 }
 
 impl<'a> Executor<'a> {
@@ -234,6 +237,7 @@ impl<'a> Executor<'a> {
             max_queue_bytes: 0,
             discard_failed_outputs: false,
             render_source_factory: None,
+            codec_preferences: CodecPreferences::default(),
         }
     }
 
@@ -255,6 +259,14 @@ impl<'a> Executor<'a> {
     /// `1` forces strictly serial execution; `≥ 2` requests pipelined.
     pub fn with_threads(mut self, n: usize) -> Self {
         self.explicit_threads = Some(n);
+        self
+    }
+
+    /// Override codec implementation selection for every decode/encode stage.
+    /// This allows a consumer to require hardware acceleration or explicitly
+    /// opt out while keeping all implementations registered in one runtime.
+    pub fn with_codec_preferences(mut self, preferences: CodecPreferences) -> Self {
+        self.codec_preferences = preferences;
         self
     }
 
@@ -686,8 +698,13 @@ impl<'a> Executor<'a> {
         // path passes its own thread budget below.
         let ctx = ExecutionContext::serial();
         for pl in &mut pipelines {
-            pl.instantiate(&self.ctx.codecs, &ctx, &self.ctx.filters)
-                .map_err(&prep)?;
+            pl.instantiate(
+                &self.ctx.codecs,
+                &self.codec_preferences,
+                &ctx,
+                &self.ctx.filters,
+            )
+            .map_err(&prep)?;
         }
 
         // Build the per-track output stream infos + open (or replace) the sink.
@@ -1180,7 +1197,12 @@ impl<'a> Executor<'a> {
         }
         let ctx = ExecutionContext::with_threads(threads);
         for pl in &mut pipelines {
-            pl.instantiate(&self.ctx.codecs, &ctx, &self.ctx.filters)?;
+            pl.instantiate(
+                &self.ctx.codecs,
+                &self.codec_preferences,
+                &ctx,
+                &self.ctx.filters,
+            )?;
         }
         let out_streams = build_output_streams(&mut pipelines);
         let sink = self.open_sink(name, &out_streams)?;
@@ -1415,6 +1437,7 @@ impl TrackRuntime {
     pub(crate) fn instantiate(
         &mut self,
         codecs: &CodecRegistry,
+        preferences: &CodecPreferences,
         ctx: &ExecutionContext,
         filters: &FilterRegistry,
     ) -> Result<()> {
@@ -1430,7 +1453,7 @@ impl TrackRuntime {
             match stage {
                 StageSpec::Decode => {
                     if self.decoder.is_none() {
-                        let mut d = make_decoder(codecs, &self.input_params)?;
+                        let mut d = make_decoder_with(codecs, &self.input_params, preferences)?;
                         d.set_execution_context(ctx);
                         self.decoder = Some(d);
                     }
@@ -1517,7 +1540,7 @@ impl TrackRuntime {
                     if let Some(h) = params.get("height").and_then(|b| b.as_u64()) {
                         enc_params.height = Some(h as u32);
                     }
-                    let mut encoder = make_encoder(codecs, &enc_params)?;
+                    let mut encoder = make_encoder_with(codecs, &enc_params, preferences)?;
                     encoder.set_execution_context(ctx);
                     let out_params = encoder.output_params().clone();
                     running = out_params.clone();
