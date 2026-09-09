@@ -30,18 +30,18 @@
 //! [`AbortState`]; the first error wins, other stages bail cleanly.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use oxideav_core::Demuxer;
-use oxideav_core::{Decoder, Encoder};
 use oxideav_core::{
-    Error, Frame, FrameLease, FrameSource, MediaType, Packet, PacketSource, Result, StreamInfo,
-    TimeBase,
+    CancellationToken, Error, Frame, FrameLease, FrameSource, MediaType, Packet, PacketSource,
+    Result, StreamInfo, TimeBase,
 };
+use oxideav_core::{Decoder, Encoder};
 
 use crate::executor::{
     flush_frame_stage_emit, frame_stage_failure_kind, run_frame_stage_emit, ExecutorStats,
@@ -486,9 +486,9 @@ impl PipelineCounters {
 /// worker can poll the flag and so [`crate::ExecutorHandle`] can
 /// flip it from the outside.
 pub(crate) struct AbortState {
-    /// Set by any worker that errors out (or by the mux thread at EOF).
-    /// Workers poll it between iterations and bail cleanly.
-    pub(crate) abort: AtomicBool,
+    /// Shared cancellation primitive. Worker loops poll it and blocking
+    /// decoder waits register wake targets against the same token.
+    cancellation: CancellationToken,
     /// First `Err(_)` seen, with its stage/track attribution. Later
     /// errors are dropped so the caller gets the root cause rather
     /// than a cascading symptom.
@@ -498,17 +498,21 @@ pub(crate) struct AbortState {
 impl AbortState {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
-            abort: AtomicBool::new(false),
+            cancellation: CancellationToken::new(),
             first_err: Mutex::new(None),
         })
     }
 
     pub(crate) fn is_aborted(&self) -> bool {
-        self.abort.load(Ordering::SeqCst)
+        self.cancellation.is_cancelled()
     }
 
     pub(crate) fn request_abort(&self) {
-        self.abort.store(true, Ordering::SeqCst);
+        self.cancellation.cancel();
+    }
+
+    pub(crate) fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation.clone()
     }
 
     fn record_failure(&self, f: StageFailure) {
@@ -516,7 +520,8 @@ impl AbortState {
         if slot.is_none() {
             *slot = Some(f);
         }
-        self.abort.store(true, Ordering::SeqCst);
+        drop(slot);
+        self.cancellation.cancel();
     }
 
     fn take_failure(&self) -> Option<StageFailure> {
@@ -632,6 +637,12 @@ pub(crate) fn run_pipelined_inner(
     // External abort takes precedence so callers (e.g. `ExecutorHandle`)
     // can pre-arm cancellation before the workers spawn.
     let abort = control.abort.unwrap_or_else(AbortState::new);
+    let cancellation = abort.cancellation_token();
+    for pipeline in &mut pipelines {
+        if let Some(decoder) = pipeline.decoder.as_mut() {
+            decoder.set_cancellation_token(cancellation.clone());
+        }
+    }
     let counters = Arc::new(PipelineCounters::default());
     let mut handles: Vec<JoinHandle<()>> = Vec::new();
     let progress_tx = control.progress_tx;
@@ -1130,7 +1141,7 @@ pub(crate) fn run_pipelined_inner(
     }
 
     // Drain abort flag + wait for workers regardless of exit path.
-    abort.abort.store(true, Ordering::SeqCst);
+    abort.request_abort();
     // Drop the mux-end receivers BEFORE joining workers. Upstream
     // stages (copy / decode / filter / pix-convert / demux) may be
     // blocked inside `SyncSender::send()` because the bounded
@@ -1329,7 +1340,7 @@ fn run_demuxer_stage(
                 };
                 for (_, tx) in &routes {
                     if tx.send(Msg::Barrier(kind)).is_err() {
-                        abort.abort.store(true, Ordering::SeqCst);
+                        abort.request_abort();
                         return Ok(());
                     }
                 }
@@ -1355,7 +1366,7 @@ fn run_demuxer_stage(
                         // reached a receiver, so the consumer will never
                         // release it — undo the admit here.
                         budget.release(bytes);
-                        abort.abort.store(true, Ordering::SeqCst);
+                        abort.request_abort();
                         break;
                     }
                 }
@@ -1447,7 +1458,7 @@ fn run_packet_source_stage(
                 };
                 for (_, tx) in &routes {
                     if tx.send(Msg::Barrier(kind)).is_err() {
-                        abort.abort.store(true, Ordering::SeqCst);
+                        abort.request_abort();
                         return Ok(());
                     }
                 }
@@ -1464,7 +1475,7 @@ fn run_packet_source_stage(
                     budget.admit(bytes);
                     if tx.send(Msg::Data(pkt.clone())).is_err() {
                         budget.release(bytes);
-                        abort.abort.store(true, Ordering::SeqCst);
+                        abort.request_abort();
                         break;
                     }
                 }
@@ -1516,7 +1527,7 @@ fn run_frame_source_stage(
                 };
                 for tx in &routes {
                     if tx.send(Msg::Barrier(kind)).is_err() {
-                        abort.abort.store(true, Ordering::SeqCst);
+                        abort.request_abort();
                         return Ok(());
                     }
                 }
@@ -1528,7 +1539,7 @@ fn run_frame_source_stage(
                 let lease = FrameLease::from_frame(frame);
                 for tx in &routes {
                     if tx.send(Msg::Data(lease.clone())).is_err() {
-                        abort.abort.store(true, Ordering::SeqCst);
+                        abort.request_abort();
                         break;
                     }
                 }
@@ -1636,6 +1647,12 @@ fn run_decode_stage(
                 // a skipped packet still frees its budget slot.
                 budget.release(pkt.data.len() as u64);
                 if let Err(e) = decoder.send_packet(&pkt) {
+                    if e.is_cancelled() && abort.is_aborted() {
+                        break 'outer;
+                    }
+                    if e.is_cancelled() || e.is_resource_exhausted() {
+                        return Err(e);
+                    }
                     counters.packets_skipped.fetch_add(1, Ordering::SeqCst);
                     eprintln!(
                         "pipeline: decoder skipped packet (stream {}, pts {:?}): {}",
@@ -1653,7 +1670,7 @@ fn run_decode_stage(
                             counters.frames_decoded.fetch_add(1, Ordering::SeqCst);
                             produced_any = true;
                             if tx.send(Msg::Data(frame)).is_err() {
-                                abort.abort.store(true, Ordering::SeqCst);
+                                abort.request_abort();
                                 break 'outer;
                             }
                         }
@@ -1766,7 +1783,7 @@ fn run_frame_stage_worker(
                 dispatch_extras(emissions.extras, &extras_tx, extras_base, &abort);
                 for frame in emissions.primary {
                     if tx.send(Msg::Data(FrameLease::from_frame(frame))).is_err() {
-                        abort.abort.store(true, Ordering::SeqCst);
+                        abort.request_abort();
                         break;
                     }
                 }
@@ -1844,7 +1861,7 @@ fn dispatch_extras(
             payload: OutputPayload::Frame(FrameLease::from_frame(frame)),
         };
         if tx.send(Msg::Data(item)).is_err() {
-            abort.abort.store(true, Ordering::SeqCst);
+            abort.request_abort();
             return;
         }
     }
@@ -2155,5 +2172,82 @@ mod tests {
         b.admit(200); // 200 >= 100 — would park
         abort.request_abort();
         b.wait_below_ceiling(&abort); // must return promptly, not hang
+    }
+
+    struct CancellationBlockingDecoder {
+        codec_id: oxideav_core::CodecId,
+        pool: Arc<oxideav_core::arena::sync::ArenaPool>,
+        _retained: oxideav_core::arena::sync::Arena,
+        cancellation: Option<CancellationToken>,
+    }
+
+    impl Decoder for CancellationBlockingDecoder {
+        fn codec_id(&self) -> &oxideav_core::CodecId {
+            &self.codec_id
+        }
+
+        fn send_packet(&mut self, _packet: &Packet) -> Result<()> {
+            let token = self
+                .cancellation
+                .as_ref()
+                .expect("pipeline supplied cancellation token");
+            self.pool.lease_wait_cancellable(token).map(|_| ())
+        }
+
+        fn receive_frame(&mut self) -> Result<Frame> {
+            Err(Error::NeedMore)
+        }
+
+        fn flush(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn set_cancellation_token(&mut self, token: CancellationToken) {
+            self.cancellation = Some(token);
+        }
+    }
+
+    #[test]
+    fn decoder_arena_wait_unwinds_cleanly_on_pipeline_abort() {
+        let pool = oxideav_core::arena::sync::ArenaPool::new(1, 64);
+        let retained = pool.lease().expect("occupy only arena slot");
+        let abort = AbortState::new();
+        let mut decoder: Box<dyn Decoder> = Box::new(CancellationBlockingDecoder {
+            codec_id: oxideav_core::CodecId::new("cancel-test"),
+            pool: Arc::clone(&pool),
+            _retained: retained,
+            cancellation: None,
+        });
+        decoder.set_cancellation_token(abort.cancellation_token());
+
+        let (packet_tx, packet_rx) = mpsc::sync_channel(1);
+        let (frame_tx, _frame_rx) = mpsc::sync_channel(1);
+        let counters = Arc::new(PipelineCounters::default());
+        let budget = QueueBudget::new(0);
+        let worker_abort = Arc::clone(&abort);
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result =
+                run_decode_stage(decoder, packet_rx, frame_tx, worker_abort, counters, budget);
+            done_tx.send(result).expect("report worker result");
+        });
+
+        packet_tx
+            .send(Msg::Data(Packet::new(0, TimeBase::new(1, 1), vec![1])))
+            .expect("send packet");
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(30)).is_err(),
+            "decoder should be blocked on its arena before abort"
+        );
+
+        abort.request_abort();
+        let result = done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("abort must wake the blocked decoder");
+        assert!(
+            result.is_ok(),
+            "external abort should unwind cleanly: {result:?}"
+        );
+        worker.join().expect("decode worker");
     }
 }
