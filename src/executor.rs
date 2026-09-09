@@ -670,6 +670,7 @@ impl<'a> Executor<'a> {
                 .ok_or_else(|| prep(Error::invalid("selected stream not in source")))?;
             pl.input_params = info.params.clone();
             pl.input_time_base = info.time_base;
+            pl.input_start_time = info.start_time;
         }
 
         // Drop pumps no track of THIS output uses — the DAG probe in
@@ -1189,6 +1190,7 @@ impl<'a> Executor<'a> {
                 .ok_or_else(|| Error::invalid("selected stream not in source"))?;
             pl.input_params = info.params.clone();
             pl.input_time_base = info.time_base;
+            pl.input_start_time = info.start_time;
         }
         // Auto-insert pixel-format conversion stages now that we know
         // the source stream's pixel format.
@@ -1301,6 +1303,11 @@ pub(crate) struct TrackRuntime {
     pub(crate) stages: Vec<StageSpec>,
     pub(crate) input_params: CodecParameters,
     pub(crate) input_time_base: TimeBase,
+    /// Start timestamp advertised by the selected source stream, in
+    /// `input_time_base` units. `None` is significant: sources such as
+    /// MPEG-TS may not know their first timestamp until packets flow, so
+    /// downstream sinks must not invent a zero origin.
+    pub(crate) input_start_time: Option<i64>,
     pub(crate) decoder: Option<Box<dyn Decoder>>,
     /// Per-frame stages in order (filters + pixel-format conversions)
     /// between the decoder and the encoder. The pipelined runner
@@ -1405,6 +1412,7 @@ impl TrackRuntime {
             stages,
             input_params: CodecParameters::audio(CodecId::new("")),
             input_time_base: TimeBase::new(1, 1),
+            input_start_time: None,
             decoder: None,
             frame_stages: Vec::new(),
             encoder: None,
@@ -2171,11 +2179,14 @@ pub(crate) fn extra_port_stream(port: &PortParams) -> (CodecParameters, TimeBase
 pub(crate) fn build_output_streams(pipelines: &mut [TrackRuntime]) -> Vec<StreamInfo> {
     let mut out = Vec::with_capacity(pipelines.len());
     for (i, pl) in pipelines.iter().enumerate() {
+        let output_time_base = pl.output_time_base();
         out.push(StreamInfo {
             index: i as u32,
-            time_base: pl.output_time_base(),
+            time_base: output_time_base,
             duration: None,
-            start_time: Some(0),
+            start_time: pl
+                .input_start_time
+                .and_then(|start| pl.input_time_base.rescale_checked(start, output_time_base)),
             params: pl.output_params().clone(),
         });
     }
@@ -2511,6 +2522,40 @@ mod tests {
             Some("mkv")
         );
         assert_eq!(ext_from_uri("/no/ext"), None);
+    }
+
+    #[test]
+    fn output_stream_preserves_unknown_source_start_time() {
+        let mut track = TrackRuntime::new(
+            "test://video".to_string(),
+            ResolvedSelector::any(),
+            MediaType::Video,
+            false,
+            Vec::new(),
+        );
+        track.input_time_base = TimeBase::new(1, 90_000);
+        track.input_start_time = None;
+
+        let streams = build_output_streams(std::slice::from_mut(&mut track));
+        assert_eq!(streams[0].start_time, None);
+    }
+
+    #[test]
+    fn output_stream_rescales_known_source_start_time() {
+        let mut track = TrackRuntime::new(
+            "test://audio".to_string(),
+            ResolvedSelector::any(),
+            MediaType::Audio,
+            false,
+            Vec::new(),
+        );
+        track.input_time_base = TimeBase::new(1, 90_000);
+        track.input_start_time = Some(6_300_000);
+        track.encoder_time_base = Some(TimeBase::new(1, 1_000));
+
+        let streams = build_output_streams(std::slice::from_mut(&mut track));
+        assert_eq!(streams[0].time_base, TimeBase::new(1, 1_000));
+        assert_eq!(streams[0].start_time, Some(70_000));
     }
 
     use std::any::Any;
