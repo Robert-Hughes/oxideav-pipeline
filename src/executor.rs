@@ -671,6 +671,7 @@ impl<'a> Executor<'a> {
             pl.input_params = info.params.clone();
             pl.input_time_base = info.time_base;
             pl.input_start_time = info.start_time;
+            pl.input_duration = info.duration;
         }
 
         // Drop pumps no track of THIS output uses — the DAG probe in
@@ -1191,6 +1192,7 @@ impl<'a> Executor<'a> {
             pl.input_params = info.params.clone();
             pl.input_time_base = info.time_base;
             pl.input_start_time = info.start_time;
+            pl.input_duration = info.duration;
         }
         // Auto-insert pixel-format conversion stages now that we know
         // the source stream's pixel format.
@@ -1308,6 +1310,9 @@ pub(crate) struct TrackRuntime {
     /// MPEG-TS may not know their first timestamp until packets flow, so
     /// downstream sinks must not invent a zero origin.
     pub(crate) input_start_time: Option<i64>,
+    /// Duration advertised by the selected source stream, in
+    /// `input_time_base` units. Preserved/rescaled for sink-facing metadata.
+    pub(crate) input_duration: Option<i64>,
     pub(crate) decoder: Option<Box<dyn Decoder>>,
     /// Per-frame stages in order (filters + pixel-format conversions)
     /// between the decoder and the encoder. The pipelined runner
@@ -1413,6 +1418,7 @@ impl TrackRuntime {
             input_params: CodecParameters::audio(CodecId::new("")),
             input_time_base: TimeBase::new(1, 1),
             input_start_time: None,
+            input_duration: None,
             decoder: None,
             frame_stages: Vec::new(),
             encoder: None,
@@ -2183,7 +2189,10 @@ pub(crate) fn build_output_streams(pipelines: &mut [TrackRuntime]) -> Vec<Stream
         out.push(StreamInfo {
             index: i as u32,
             time_base: output_time_base,
-            duration: None,
+            duration: pl.input_duration.and_then(|duration| {
+                pl.input_time_base
+                    .rescale_checked(duration, output_time_base)
+            }),
             start_time: pl
                 .input_start_time
                 .and_then(|start| pl.input_time_base.rescale_checked(start, output_time_base)),
@@ -2551,11 +2560,13 @@ mod tests {
         );
         track.input_time_base = TimeBase::new(1, 90_000);
         track.input_start_time = Some(6_300_000);
+        track.input_duration = Some(540_000);
         track.encoder_time_base = Some(TimeBase::new(1, 1_000));
 
         let streams = build_output_streams(std::slice::from_mut(&mut track));
         assert_eq!(streams[0].time_base, TimeBase::new(1, 1_000));
         assert_eq!(streams[0].start_time, Some(70_000));
+        assert_eq!(streams[0].duration, Some(6_000));
     }
 
     use std::any::Any;

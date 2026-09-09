@@ -1385,11 +1385,11 @@ fn run_demuxer_stage(
 /// [`PacketSource`] (RTMP, future SRT / RTSP, …) — same per-stream
 /// fan-out, same byte-budget accounting, no container layer.
 ///
-/// [`PacketSource`] has no seek surface, so every [`SeekCmd`] is
-/// answered with a [`BarrierKind::SeekRejected`] carrying the
-/// command's generation: the pipeline keeps producing packets from
-/// where it was and the engine learns to disable its seek UI, exactly
-/// as with a demuxer whose `seek_to` is unimplemented.
+/// Packet sources may optionally implement [`PacketSource::seek_to`]. A
+/// successful seek emits [`BarrierKind::SeekFlush`] so downstream workers
+/// reset codec/filter state; an unsupported/rejected seek emits
+/// [`BarrierKind::SeekRejected`] and leaves the source running from its prior
+/// position. This mirrors the demuxer-source control path.
 /// Resolve which stream of THIS source a [`SeekCmd`] should move, and
 /// to what pts.
 ///
@@ -1447,14 +1447,22 @@ fn run_packet_source_stage(
         if let Some(rx) = &seek_rx {
             while let Ok(cmd) = rx.try_recv() {
                 // Seek-owner duty (see `run_demuxer_stage`): a packet
-                // source can own the receiver in a mixed-shape
-                // multi-URI job; siblings still need the forward even
-                // though this source itself rejects.
+                // source can own the receiver in a mixed-shape multi-URI
+                // job, so siblings receive the same command first.
                 for tx in &seek_fanout {
                     let _ = tx.send(cmd);
                 }
-                let kind = BarrierKind::SeekRejected {
-                    generation: cmd.generation,
+                let (dst_stream, dst_pts, dst_tb) =
+                    resolve_seek_target(&routes, src.streams(), &cmd);
+                let kind = match src.seek_to(dst_stream, dst_pts) {
+                    Ok(landed_pts) => BarrierKind::SeekFlush {
+                        generation: cmd.generation,
+                        landed_pts,
+                        time_base: dst_tb,
+                    },
+                    Err(_e) => BarrierKind::SeekRejected {
+                        generation: cmd.generation,
+                    },
                 };
                 for (_, tx) in &routes {
                     if tx.send(Msg::Barrier(kind)).is_err() {
