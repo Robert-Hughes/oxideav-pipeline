@@ -38,8 +38,8 @@ use std::time::{Duration, Instant};
 
 use oxideav_core::Demuxer;
 use oxideav_core::{
-    CancellationToken, Error, Frame, FrameLease, FrameSource, MediaType, Packet, PacketSource,
-    Result, StreamInfo, TimeBase,
+    CancellationToken, CodecParameters, Error, Frame, FrameLease, FrameSource, MediaType, Packet,
+    PacketSource, Result, StreamInfo, TimeBase,
 };
 use oxideav_core::{Decoder, Encoder};
 
@@ -440,12 +440,15 @@ impl QueueBudget {
 /// Messages across channels.
 ///
 /// * `Data` — payload (packet/frame).
+/// * `StreamUpdate` — authoritative decoded stream metadata discovered after
+///   `JobSink::start()`; ordered before frames that use the new format.
 /// * `Barrier` — flow-control marker. Today only `SeekFlush` is in use;
 ///   workers reset codec/filter state and forward unchanged.
 /// * `Eof` — in-band end-of-stream so downstream stages can flush state
 ///   before exiting.
 enum Msg<T> {
     Data(T),
+    StreamUpdate(Box<StreamInfo>),
     Barrier(BarrierKind),
     Eof,
 }
@@ -761,6 +764,15 @@ pub(crate) fn run_pipelined_inner(
             // Each FrameStage runs on its own worker thread so audio
             // filters, pixel-format converts, and future video filters
             // can overlap the encoder's back-pressure.
+            //
+            // A direct decode→sink route may discover its true decoded
+            // shape only after the first packet (notably ADTS AAC in
+            // MPEG-TS). Give that decoder a sink-facing stream template so
+            // it can emit an ordered StreamUpdate before its first frame.
+            // Routes with filters/encoders keep their existing fixed output
+            // description because those stages may transform the shape.
+            let stream_update = (pl.frame_stages.is_empty() && pl.encoder.is_none())
+                .then(|| out_streams[track_idx].clone());
             let decoder = match pl.decoder.take() {
                 Some(d) => d,
                 None => {
@@ -787,7 +799,15 @@ pub(crate) fn run_pipelined_inner(
                 FailureStage::Decode,
                 Some(track_idx as u32),
                 move |abort| {
-                    run_decode_stage(decoder, pkt_rx, frame0_tx, abort, counters_d, budget_d)
+                    run_decode_stage(
+                        decoder,
+                        pkt_rx,
+                        frame0_tx,
+                        stream_update,
+                        abort,
+                        counters_d,
+                        budget_d,
+                    )
                 },
             ));
             frame0_rx
@@ -1098,6 +1118,17 @@ pub(crate) fn run_pipelined_inner(
                             packets_encoded: encoded,
                             packets_copied: copied,
                         });
+                    }
+                }
+                Ok(Msg::StreamUpdate(stream)) => {
+                    made_progress = true;
+                    if let Err(e) = sink.stream_update(&stream) {
+                        abort.record_failure(StageFailure::new(
+                            FailureStage::Sink,
+                            Some(stream.index),
+                            e,
+                        ));
+                        break;
                     }
                 }
                 Ok(Msg::Barrier(kind)) => {
@@ -1595,6 +1626,9 @@ fn run_copy_stage(
                 }
                 counters.packets_copied.fetch_add(1, Ordering::SeqCst);
             }
+            Ok(Msg::StreamUpdate(_)) => {
+                // Packet sources never emit decoder-format updates.
+            }
             Ok(Msg::Barrier(b)) => {
                 // Copy stages have no internal state — just forward.
                 if out_tx.send(Msg::Barrier(b)).is_err() {
@@ -1613,10 +1647,12 @@ fn run_decode_stage(
     mut decoder: Box<dyn Decoder>,
     rx: Receiver<Msg<Packet>>,
     tx: SyncSender<Msg<FrameLease>>,
+    mut stream_template: Option<StreamInfo>,
     abort: Arc<AbortState>,
     counters: Arc<PipelineCounters>,
     budget: Arc<QueueBudget>,
 ) -> Result<()> {
+    let mut last_stream_params: Option<CodecParameters> = None;
     // Stream frames through `tx` as they're produced rather than
     // collecting into a `Vec` first. Bounded `tx.send` provides natural
     // back-pressure: once the downstream stage is full, send blocks and
@@ -1668,6 +1704,25 @@ fn run_decode_stage(
                     );
                     continue;
                 }
+
+                if let (Some(template), Some(params)) =
+                    (stream_template.as_mut(), decoder.output_params())
+                {
+                    let changed = last_stream_params
+                        .as_ref()
+                        .map_or(true, |last| !last.matches_core(params));
+                    if changed {
+                        template.params = params.clone();
+                        if tx
+                            .send(Msg::StreamUpdate(Box::new(template.clone())))
+                            .is_err()
+                        {
+                            abort.request_abort();
+                            break 'outer;
+                        }
+                        last_stream_params = Some(params.clone());
+                    }
+                }
                 let mut produced_any = false;
                 loop {
                     if abort.is_aborted() {
@@ -1715,6 +1770,10 @@ fn run_decode_stage(
                         }
                     }
                 }
+            }
+            Ok(Msg::StreamUpdate(_)) => {
+                // Decoder input is compressed packets; format updates only
+                // originate from this stage, never upstream of it.
             }
             Ok(Msg::Barrier(b)) => {
                 // SeekFlush: drop any in-flight buffered frames + reset
@@ -1795,6 +1854,11 @@ fn run_frame_stage_worker(
                         break;
                     }
                 }
+            }
+            Ok(Msg::StreamUpdate(_)) => {
+                // Direct decoder-format updates are only enabled when there
+                // are no frame-transform stages, because a filter may change
+                // the output shape and would need to publish its own format.
             }
             Ok(Msg::Barrier(b)) => {
                 // Filter stages may hold rolling-window state (spectrogram
@@ -1895,6 +1959,10 @@ fn run_encode_stage(
                 encoder.send_frame(&frame)?;
                 drain_and_send(encoder.as_mut(), &out_tx, track_index, kind, &counters)?;
             }
+            Ok(Msg::StreamUpdate(_)) => {
+                // Decoder-format updates are not enabled on encoded routes;
+                // the encoder owns the sink-facing output parameters.
+            }
             Ok(Msg::Barrier(b)) => {
                 // The encoder trait has no `reset()` today — flush
                 // anything pending and forward the barrier. A future
@@ -1947,6 +2015,11 @@ fn run_frame_fanout(
                     }))
                     .is_err()
                 {
+                    break;
+                }
+            }
+            Ok(Msg::StreamUpdate(stream)) => {
+                if out_tx.send(Msg::StreamUpdate(stream)).is_err() {
                     break;
                 }
             }
@@ -2182,6 +2255,96 @@ mod tests {
         b.wait_below_ceiling(&abort); // must return promptly, not hang
     }
 
+    struct FormatDiscoveringDecoder {
+        codec_id: oxideav_core::CodecId,
+        params: CodecParameters,
+        pending: bool,
+    }
+
+    impl Decoder for FormatDiscoveringDecoder {
+        fn codec_id(&self) -> &oxideav_core::CodecId {
+            &self.codec_id
+        }
+
+        fn output_params(&self) -> Option<&CodecParameters> {
+            Some(&self.params)
+        }
+
+        fn send_packet(&mut self, _packet: &Packet) -> Result<()> {
+            self.params.sample_rate = Some(48_000);
+            self.params.channels = Some(2);
+            self.params.sample_format = Some(oxideav_core::SampleFormat::S16);
+            self.pending = true;
+            Ok(())
+        }
+
+        fn receive_frame(&mut self) -> Result<Frame> {
+            if !self.pending {
+                return Err(Error::NeedMore);
+            }
+            self.pending = false;
+            Ok(Frame::Audio(oxideav_core::AudioFrame {
+                samples: 1024,
+                pts: Some(90_000),
+                data: vec![vec![0; 1024 * 2 * 2]],
+            }))
+        }
+
+        fn flush(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn decode_stage_emits_authoritative_stream_update_before_first_frame() {
+        let params = CodecParameters::audio(oxideav_core::CodecId::new("dynamic-audio"));
+        let decoder: Box<dyn Decoder> = Box::new(FormatDiscoveringDecoder {
+            codec_id: oxideav_core::CodecId::new("dynamic-audio"),
+            params: params.clone(),
+            pending: false,
+        });
+        let template = StreamInfo {
+            index: 0,
+            time_base: TimeBase::new(1, 90_000),
+            duration: None,
+            start_time: None,
+            params,
+        };
+        let (packet_tx, packet_rx) = mpsc::sync_channel(2);
+        let (frame_tx, frame_rx) = mpsc::sync_channel(4);
+        let counters = Arc::new(PipelineCounters::default());
+        let budget = QueueBudget::new(0);
+        let abort = AbortState::new();
+
+        packet_tx
+            .send(Msg::Data(Packet::new(0, TimeBase::new(1, 90_000), vec![1])))
+            .unwrap();
+        packet_tx.send(Msg::Eof).unwrap();
+
+        run_decode_stage(
+            decoder,
+            packet_rx,
+            frame_tx,
+            Some(template),
+            abort,
+            counters,
+            budget,
+        )
+        .unwrap();
+
+        let Msg::StreamUpdate(update) = frame_rx.recv().unwrap() else {
+            panic!("expected stream update before decoded frame");
+        };
+        assert_eq!(update.params.sample_rate, Some(48_000));
+        assert_eq!(update.params.channels, Some(2));
+        assert_eq!(
+            update.params.sample_format,
+            Some(oxideav_core::SampleFormat::S16)
+        );
+        assert!(matches!(frame_rx.recv().unwrap(), Msg::Data(_)));
+        assert!(matches!(frame_rx.recv().unwrap(), Msg::Eof));
+    }
+
     struct CancellationBlockingDecoder {
         codec_id: oxideav_core::CodecId,
         pool: Arc<oxideav_core::arena::sync::ArenaPool>,
@@ -2235,8 +2398,15 @@ mod tests {
         let worker_abort = Arc::clone(&abort);
         let (done_tx, done_rx) = mpsc::channel();
         let worker = std::thread::spawn(move || {
-            let result =
-                run_decode_stage(decoder, packet_rx, frame_tx, worker_abort, counters, budget);
+            let result = run_decode_stage(
+                decoder,
+                packet_rx,
+                frame_tx,
+                None,
+                worker_abort,
+                counters,
+                budget,
+            );
             done_tx.send(result).expect("report worker result");
         });
 

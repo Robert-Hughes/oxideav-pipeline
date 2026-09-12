@@ -141,6 +141,19 @@ pub trait JobSink {
         let frame = lease.into_frame()?;
         self.write_frame(kind, &frame)
     }
+
+    /// Notify the sink that a decoder has learned authoritative output
+    /// parameters after `start()`. In-band configured codecs such as
+    /// MPEG-TS/ADTS AAC may not know their PCM shape until the first packet
+    /// is decoded. The staged runner orders this update before the first
+    /// frame produced with those parameters.
+    ///
+    /// File/muxer sinks that require a fixed header may keep the default
+    /// no-op; player-style sinks should override this when they configure
+    /// output devices from decoded format metadata.
+    fn stream_update(&mut self, _stream: &StreamInfo) -> Result<()> {
+        Ok(())
+    }
     /// Drain any remaining internal state and finalise the output.
     fn finish(&mut self) -> Result<()>;
 
