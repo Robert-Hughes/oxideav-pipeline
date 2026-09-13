@@ -22,7 +22,9 @@ pub mod staged;
 pub mod validate;
 
 pub use dag::{Dag, DagNode, NodeId};
-pub use executor::{Executor, ExecutorHandle, JobSink, RenderSourceFactory};
+pub use executor::{
+    Executor, ExecutorHandle, JobSink, RenderSourceFactory, TrackSink, TrackSinkInfo,
+};
 pub use failure::{FailureStage, RunFailure};
 pub use oxideav_core::{FilterFactory, FilterRegistry};
 pub use schema::{

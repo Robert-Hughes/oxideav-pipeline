@@ -45,7 +45,7 @@ use oxideav_core::{Decoder, Encoder};
 
 use crate::executor::{
     flush_frame_stage_emit, frame_stage_failure_kind, run_frame_stage_emit, ExecutorStats,
-    FrameStage, JobSink, SourcePump, TrackRuntime,
+    FrameStage, JobSink, SourcePump, TrackRuntime, TrackSink, TrackSinkInfo,
 };
 use crate::failure::{attribute, FailureStage, StageFailure, StageResult};
 
@@ -545,6 +545,237 @@ enum OutputPayload {
     Frame(FrameLease),
 }
 
+enum DeliveryStatus {
+    Delivered,
+    Closed,
+}
+
+enum TrackTerminalTarget {
+    Aggregate(SyncSender<Msg<OutputItem>>),
+    Independent(Box<dyn TrackSink + Send>),
+}
+
+struct TrackTerminal {
+    track_index: u32,
+    kind: MediaType,
+    target: TrackTerminalTarget,
+    abort: Arc<AbortState>,
+}
+
+impl TrackTerminal {
+    fn aggregate_sender(&self) -> Option<SyncSender<Msg<OutputItem>>> {
+        match &self.target {
+            TrackTerminalTarget::Aggregate(tx) => Some(tx.clone()),
+            TrackTerminalTarget::Independent(_) => None,
+        }
+    }
+
+    fn is_independent(&self) -> bool {
+        matches!(&self.target, TrackTerminalTarget::Independent(_))
+    }
+
+    fn record_sink_result(
+        abort: &Arc<AbortState>,
+        track_index: u32,
+        result: Result<()>,
+    ) -> Result<DeliveryStatus> {
+        match result {
+            Ok(()) => Ok(DeliveryStatus::Delivered),
+            Err(error) if error.is_cancelled() && abort.is_aborted() => Err(error),
+            Err(error) => {
+                abort.record_failure(StageFailure::new(
+                    FailureStage::Sink,
+                    Some(track_index),
+                    error,
+                ));
+                Err(Error::cancelled(
+                    "pipeline: independent TrackSink failed; aborting sibling stages",
+                ))
+            }
+        }
+    }
+
+    fn write_packet(&mut self, packet: Packet) -> Result<DeliveryStatus> {
+        let abort = self.abort.clone();
+        let track_index = self.track_index;
+        match &mut self.target {
+            TrackTerminalTarget::Aggregate(tx) => match tx.send(Msg::Data(OutputItem {
+                track_index,
+                kind: self.kind,
+                payload: OutputPayload::Packet(packet),
+            })) {
+                Ok(()) => Ok(DeliveryStatus::Delivered),
+                Err(_) => Ok(DeliveryStatus::Closed),
+            },
+            TrackTerminalTarget::Independent(sink) => Self::record_sink_result(
+                &abort,
+                track_index,
+                sink.write_packet(track_index, self.kind, packet),
+            ),
+        }
+    }
+
+    fn write_frame(&mut self, frame: FrameLease) -> Result<DeliveryStatus> {
+        let abort = self.abort.clone();
+        let track_index = self.track_index;
+        match &mut self.target {
+            TrackTerminalTarget::Aggregate(tx) => match tx.send(Msg::Data(OutputItem {
+                track_index,
+                kind: self.kind,
+                payload: OutputPayload::Frame(frame),
+            })) {
+                Ok(()) => Ok(DeliveryStatus::Delivered),
+                Err(_) => Ok(DeliveryStatus::Closed),
+            },
+            TrackTerminalTarget::Independent(sink) => Self::record_sink_result(
+                &abort,
+                track_index,
+                sink.write_frame_lease(track_index, self.kind, frame),
+            ),
+        }
+    }
+
+    fn stream_update(&mut self, stream: StreamInfo) -> Result<DeliveryStatus> {
+        let abort = self.abort.clone();
+        let track_index = self.track_index;
+        match &mut self.target {
+            TrackTerminalTarget::Aggregate(tx) => {
+                match tx.send(Msg::StreamUpdate(Box::new(stream))) {
+                    Ok(()) => Ok(DeliveryStatus::Delivered),
+                    Err(_) => Ok(DeliveryStatus::Closed),
+                }
+            }
+            TrackTerminalTarget::Independent(sink) => {
+                Self::record_sink_result(&abort, track_index, sink.stream_update(&stream))
+            }
+        }
+    }
+
+    fn barrier(&mut self, barrier: BarrierKind) -> Result<DeliveryStatus> {
+        let abort = self.abort.clone();
+        let track_index = self.track_index;
+        match &mut self.target {
+            TrackTerminalTarget::Aggregate(tx) => match tx.send(Msg::Barrier(barrier)) {
+                Ok(()) => Ok(DeliveryStatus::Delivered),
+                Err(_) => Ok(DeliveryStatus::Closed),
+            },
+            TrackTerminalTarget::Independent(sink) => {
+                Self::record_sink_result(&abort, track_index, sink.barrier(barrier))
+            }
+        }
+    }
+
+    fn eof(&mut self) {
+        if let TrackTerminalTarget::Aggregate(tx) = &self.target {
+            let _ = tx.send(Msg::Eof);
+        }
+    }
+}
+
+enum FrameDownstream {
+    Channel(SyncSender<Msg<FrameLease>>),
+    Terminal(TrackTerminal),
+}
+
+impl FrameDownstream {
+    fn writes_sink_directly(&self) -> bool {
+        matches!(self, FrameDownstream::Terminal(terminal) if terminal.is_independent())
+    }
+    fn send_frame(&mut self, frame: FrameLease) -> Result<DeliveryStatus> {
+        match self {
+            FrameDownstream::Channel(tx) => match tx.send(Msg::Data(frame)) {
+                Ok(()) => Ok(DeliveryStatus::Delivered),
+                Err(_) => Ok(DeliveryStatus::Closed),
+            },
+            FrameDownstream::Terminal(terminal) => terminal.write_frame(frame),
+        }
+    }
+
+    fn stream_update(&mut self, stream: StreamInfo) -> Result<DeliveryStatus> {
+        match self {
+            FrameDownstream::Channel(tx) => match tx.send(Msg::StreamUpdate(Box::new(stream))) {
+                Ok(()) => Ok(DeliveryStatus::Delivered),
+                Err(_) => Ok(DeliveryStatus::Closed),
+            },
+            FrameDownstream::Terminal(terminal) => terminal.stream_update(stream),
+        }
+    }
+
+    fn barrier(&mut self, barrier: BarrierKind) -> Result<DeliveryStatus> {
+        match self {
+            FrameDownstream::Channel(tx) => match tx.send(Msg::Barrier(barrier)) {
+                Ok(()) => Ok(DeliveryStatus::Delivered),
+                Err(_) => Ok(DeliveryStatus::Closed),
+            },
+            FrameDownstream::Terminal(terminal) => terminal.barrier(barrier),
+        }
+    }
+
+    fn eof(&mut self) {
+        match self {
+            FrameDownstream::Channel(tx) => {
+                let _ = tx.send(Msg::Eof);
+            }
+            FrameDownstream::Terminal(terminal) => terminal.eof(),
+        }
+    }
+}
+
+fn deliver_frame_downstream(
+    downstream: &mut FrameDownstream,
+    frame: FrameLease,
+    abort: &Arc<AbortState>,
+    counters: &PipelineCounters,
+) -> Result<bool> {
+    let direct = downstream.writes_sink_directly();
+    match downstream.send_frame(frame) {
+        Ok(DeliveryStatus::Delivered) => {
+            if direct {
+                counters.frames_written.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(true)
+        }
+        Ok(DeliveryStatus::Closed) => {
+            abort.request_abort();
+            Ok(false)
+        }
+        Err(e) if e.is_cancelled() && abort.is_aborted() => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+fn deliver_stream_update(
+    downstream: &mut FrameDownstream,
+    stream: StreamInfo,
+    abort: &Arc<AbortState>,
+) -> Result<bool> {
+    match downstream.stream_update(stream) {
+        Ok(DeliveryStatus::Delivered) => Ok(true),
+        Ok(DeliveryStatus::Closed) => {
+            abort.request_abort();
+            Ok(false)
+        }
+        Err(e) if e.is_cancelled() && abort.is_aborted() => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+fn deliver_frame_barrier(
+    downstream: &mut FrameDownstream,
+    barrier: BarrierKind,
+    abort: &Arc<AbortState>,
+) -> Result<bool> {
+    match downstream.barrier(barrier) {
+        Ok(DeliveryStatus::Delivered) => Ok(true),
+        Ok(DeliveryStatus::Closed) => {
+            abort.request_abort();
+            Ok(false)
+        }
+        Err(e) if e.is_cancelled() && abort.is_aborted() => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 /// Optional control bundle for [`run_pipelined`]. `seek_rx` is consumed
 /// by the (single) demuxer thread that picks it up; `progress_tx` is
 /// updated by the mux loop on every data/barrier event.
@@ -633,14 +864,63 @@ pub(crate) fn run_pipelined_inner(
         }
         failure
     };
+    // External abort takes precedence so callers (e.g. `ExecutorHandle`)
+    // can pre-arm cancellation before the workers spawn. The same token is
+    // handed to independent TrackSinks so a blocked sink can wake on abort.
+    let abort = control.abort.unwrap_or_else(AbortState::new);
+    let cancellation = abort.cancellation_token();
+
     if let Err(e) = sink.start(&out_streams) {
         return Err(fail_sink(&mut sink, attribute(FailureStage::Sink, None)(e)));
     }
 
-    // External abort takes precedence so callers (e.g. `ExecutorHandle`)
-    // can pre-arm cancellation before the workers spawn.
-    let abort = control.abort.unwrap_or_else(AbortState::new);
-    let cancellation = abort.cancellation_token();
+    let track_infos: Vec<TrackSinkInfo> = pipelines
+        .iter()
+        .enumerate()
+        .map(|(track_idx, _)| TrackSinkInfo {
+            track_index: track_idx as u32,
+            stream: out_streams[track_idx].clone(),
+        })
+        .collect();
+    let independent_track_sinks = match sink.open_track_sinks(&track_infos, cancellation.clone()) {
+        Ok(sinks) => sinks,
+        Err(e) => {
+            return Err(fail_sink(&mut sink, attribute(FailureStage::Sink, None)(e)));
+        }
+    };
+    if let Some(track_sinks) = &independent_track_sinks {
+        if track_sinks.len() != pipelines.len() {
+            return Err(fail_sink(
+                &mut sink,
+                StageFailure::new(
+                    FailureStage::Sink,
+                    None,
+                    Error::invalid(format!(
+                        "pipeline: JobSink returned {} TrackSinks for {} pipeline tracks",
+                        track_sinks.len(),
+                        pipelines.len()
+                    )),
+                ),
+            ));
+        }
+        if pipelines
+            .iter()
+            .any(|pipeline| !pipeline.extra_output_streams.is_empty())
+        {
+            return Err(fail_sink(
+                &mut sink,
+                StageFailure::new(
+                    FailureStage::Sink,
+                    None,
+                    Error::unsupported(
+                        "pipeline: independent TrackSinks do not yet support multi-port filter extras",
+                    ),
+                ),
+            ));
+        }
+    }
+    let independent_delivery = independent_track_sinks.is_some();
+
     for pipeline in &mut pipelines {
         if let Some(decoder) = pipeline.decoder.as_mut() {
             decoder.set_cancellation_token(cancellation.clone());
@@ -655,23 +935,39 @@ pub(crate) fn run_pipelined_inner(
     // (default) is a no-op: `admit` / `release` short-circuit and the
     // demuxer never parks, so the count caps alone govern.
     let budget = QueueBudget::new(control.max_queue_bytes);
-    // Wall-clock baseline used to populate `Progress::elapsed_micros`.
-    // Captured here — just before the first worker thread spawns and
-    // therefore just before any packet starts flowing — so the value
-    // surfaced on `Progress` is "microseconds since the runner began
-    // doing work", not "since the caller called `Executor::spawn`".
-    // `Instant::elapsed()` is saturating + monotonic so consecutive
-    // emissions are non-decreasing even under heavy clock skew.
     let started_at = Instant::now();
 
-    // Per-track output channel: stage workers send processed packets /
-    // frames on tx; the mux loop on the caller thread reads rx.
+    // Aggregate sinks retain the historical final per-track output channels
+    // consumed by the central mux loop. Independent TrackSinks bypass those
+    // channels: each TrackSink is moved directly into its track's terminal
+    // worker, so there is no decoded-output queue merely to hand a final result
+    // to the application.
     let mut track_output_rx: Vec<Receiver<Msg<OutputItem>>> = Vec::new();
-    let mut track_output_tx: Vec<SyncSender<Msg<OutputItem>>> = Vec::new();
-    for _ in 0..pipelines.len() {
-        let (tx, rx) = mpsc::sync_channel::<Msg<OutputItem>>(pkt_cap);
-        track_output_tx.push(tx);
-        track_output_rx.push(rx);
+    let mut terminals: Vec<Option<TrackTerminal>> = Vec::with_capacity(pipelines.len());
+    match independent_track_sinks {
+        Some(track_sinks) => {
+            for (track_idx, (pipeline, track_sink)) in pipelines.iter().zip(track_sinks).enumerate()
+            {
+                terminals.push(Some(TrackTerminal {
+                    track_index: track_idx as u32,
+                    kind: pipeline.kind,
+                    target: TrackTerminalTarget::Independent(track_sink),
+                    abort: abort.clone(),
+                }));
+            }
+        }
+        None => {
+            for (track_idx, pipeline) in pipelines.iter().enumerate() {
+                let (tx, rx) = mpsc::sync_channel::<Msg<OutputItem>>(pkt_cap);
+                track_output_rx.push(rx);
+                terminals.push(Some(TrackTerminal {
+                    track_index: track_idx as u32,
+                    kind: pipeline.kind,
+                    target: TrackTerminalTarget::Aggregate(tx),
+                    abort: abort.clone(),
+                }));
+            }
+        }
     }
 
     // Route tables: per source URI, the list of (source_stream,
@@ -686,22 +982,27 @@ pub(crate) fn run_pipelined_inner(
     // Build + spawn each track's stage chain. We consume the Vec so the
     // decoder/encoder/filters can be moved into worker threads.
     for (track_idx, mut pl) in pipelines.drain(..).enumerate() {
-        let out_tx = track_output_tx[track_idx].clone();
-        let kind = pl.kind;
         let source_uri = pl.source_uri.clone();
         let source_stream = pl.source_stream;
         let source_is_frames = matches!(
             sources_by_uri.get(&pl.source_uri),
             Some(SourcePump::Frames { .. })
         );
+        let mut terminal = Some(
+            terminals[track_idx]
+                .take()
+                .expect("pipeline: missing terminal sink for track"),
+        );
+        let aggregate_out_tx = terminal.as_ref().and_then(TrackTerminal::aggregate_sender);
+        let frame_stages = std::mem::take(&mut pl.frame_stages);
+        let encoder = pl.encoder.take();
+        let decoder_is_terminal = frame_stages.is_empty() && encoder.is_none();
 
-        // Head of this track's frame chain. Packet-producing sources
-        // (Demuxer / Packets) wire a packet channel + a copy or decode
-        // stage in front; frame-shape sources feed the chain directly
-        // from the frame-pump thread.
+        // Head of this track's frame chain. Packet-producing sources wire a
+        // packet queue to copy/decode. Frame-shape sources require a frame
+        // queue because one shared source worker may fan out to several tracks.
         let frame_head_rx: Receiver<Msg<FrameLease>> = if source_is_frames {
             if pl.copy {
-                // Structural setup error — no data has flowed yet.
                 return Err(fail_sink(
                     &mut sink,
                     StageFailure::new(
@@ -725,9 +1026,6 @@ pub(crate) fn run_pipelined_inner(
                 .push(frame0_tx);
             frame0_rx
         } else {
-            // Every packet-fed track has a packet-input channel from the
-            // source thread regardless of copy / transcode — the source
-            // thread doesn't need to know which mode each consumer uses.
             let (pkt_tx, pkt_rx) = mpsc::sync_channel::<Msg<Packet>>(pkt_cap);
             routes_by_uri
                 .entry(source_uri)
@@ -740,39 +1038,18 @@ pub(crate) fn run_pipelined_inner(
                 let budget_c = budget.clone();
                 let name = format!("copy-{track_idx}");
                 let stage_track = Some(track_idx as u32);
+                let terminal = terminal.take().expect("copy track terminal");
                 handles.push(spawn_stage(
                     abort_c,
                     name,
                     FailureStage::Copy,
                     stage_track,
-                    move |abort| {
-                        run_copy_stage(
-                            pkt_rx,
-                            out_tx,
-                            track_idx as u32,
-                            kind,
-                            abort,
-                            counters_c,
-                            budget_c,
-                        )
-                    },
+                    move |abort| run_copy_stage(pkt_rx, terminal, abort, counters_c, budget_c),
                 ));
                 continue;
             }
 
-            // Transcode: decoder → frame stages → encoder-or-fanout.
-            // Each FrameStage runs on its own worker thread so audio
-            // filters, pixel-format converts, and future video filters
-            // can overlap the encoder's back-pressure.
-            //
-            // A direct decode→sink route may discover its true decoded
-            // shape only after the first packet (notably ADTS AAC in
-            // MPEG-TS). Give that decoder a sink-facing stream template so
-            // it can emit an ordered StreamUpdate before its first frame.
-            // Routes with filters/encoders keep their existing fixed output
-            // description because those stages may transform the shape.
-            let stream_update = (pl.frame_stages.is_empty() && pl.encoder.is_none())
-                .then(|| out_streams[track_idx].clone());
+            let stream_update = decoder_is_terminal.then(|| out_streams[track_idx].clone());
             let decoder = match pl.decoder.take() {
                 Some(d) => d,
                 None => {
@@ -788,7 +1065,17 @@ pub(crate) fn run_pipelined_inner(
                     ));
                 }
             };
-            let (frame0_tx, frame0_rx) = mpsc::sync_channel::<Msg<FrameLease>>(frame_cap);
+            let (downstream, frame0_rx) = if decoder_is_terminal {
+                (
+                    FrameDownstream::Terminal(
+                        terminal.take().expect("direct decode track terminal"),
+                    ),
+                    None,
+                )
+            } else {
+                let (frame0_tx, frame0_rx) = mpsc::sync_channel::<Msg<FrameLease>>(frame_cap);
+                (FrameDownstream::Channel(frame0_tx), Some(frame0_rx))
+            };
             let abort_d = abort.clone();
             let counters_d = counters.clone();
             let budget_d = budget.clone();
@@ -802,7 +1089,7 @@ pub(crate) fn run_pipelined_inner(
                     run_decode_stage(
                         decoder,
                         pkt_rx,
-                        frame0_tx,
+                        downstream,
                         stream_update,
                         abort,
                         counters_d,
@@ -810,24 +1097,25 @@ pub(crate) fn run_pipelined_inner(
                     )
                 },
             ));
-            frame0_rx
+            if decoder_is_terminal {
+                continue;
+            }
+            frame0_rx.expect("non-terminal decoder must expose frame output")
         };
-        let frame_stages = std::mem::take(&mut pl.frame_stages);
-        let encoder = pl.encoder.take();
 
-        // Count extras as we go: the first filter stage on this track
-        // starts at the track's `extras_base_for_this_track`, the next
-        // filter picks up where the previous left off. Non-filter
-        // stages (PixConvert) never emit extras but still advance the
-        // index so downstream sinks remain consistent.
+        // Count extras as we go: the first filter stage on this track starts
+        // at extras_base_for_this_track, the next filter picks up where the
+        // previous left off. Independent TrackSink mode rejects extras above;
+        // aggregate sinks keep the historical extra-output channel.
         let extras_base_for_track: u32 = pl.extras_base_index;
         let mut running_extras_base = extras_base_for_track;
         let extra_port_counts: Vec<u32> = pl.extra_output_port_counts.clone().into_iter().collect();
         let mut extra_counts_iter = extra_port_counts.into_iter();
 
-        let mut upstream: Receiver<Msg<FrameLease>> = frame_head_rx;
+        let stage_count = frame_stages.len();
+        let mut upstream = Some(frame_head_rx);
+        let mut terminal_consumed_by_stage = false;
         for (fidx, stage) in frame_stages.into_iter().enumerate() {
-            let (ftx, frx) = mpsc::sync_channel::<Msg<FrameLease>>(frame_cap);
             let stage_kind = frame_stage_failure_kind(&stage);
             let label = match &stage {
                 FrameStage::Filter(_) => "filter",
@@ -836,14 +1124,12 @@ pub(crate) fn run_pipelined_inner(
             let name = format!("{label}-{track_idx}-{fidx}");
             let abort_f = abort.clone();
 
-            // Wire an extras channel only for Filter stages that
-            // declared extra output ports.
             let (stage_extras_tx, stage_extras_base) = if matches!(stage, FrameStage::Filter(_)) {
                 match extra_counts_iter.next() {
                     Some(n) if n > 0 => {
                         let base = running_extras_base;
                         running_extras_base += n;
-                        (Some(out_tx.clone()), base)
+                        (aggregate_out_tx.clone(), base)
                     }
                     _ => (None, 0),
                 }
@@ -851,6 +1137,19 @@ pub(crate) fn run_pipelined_inner(
                 (None, 0)
             };
 
+            let is_terminal_stage = encoder.is_none() && fidx + 1 == stage_count;
+            let (downstream, next_rx) = if is_terminal_stage {
+                (
+                    FrameDownstream::Terminal(terminal.take().expect("last frame stage terminal")),
+                    None,
+                )
+            } else {
+                let (ftx, frx) = mpsc::sync_channel::<Msg<FrameLease>>(frame_cap);
+                (FrameDownstream::Channel(ftx), Some(frx))
+            };
+            let stage_rx = upstream.take().expect("frame stage input receiver");
+
+            let counters_f = counters.clone();
             handles.push(spawn_stage(
                 abort_f,
                 name,
@@ -859,61 +1158,57 @@ pub(crate) fn run_pipelined_inner(
                 move |abort| {
                     run_frame_stage_worker(
                         stage,
-                        upstream,
-                        ftx,
+                        stage_rx,
+                        downstream,
                         stage_extras_tx,
                         stage_extras_base,
                         abort,
+                        counters_f,
                     )
                 },
             ));
-            upstream = frx;
+
+            match next_rx {
+                Some(frx) => upstream = Some(frx),
+                None => {
+                    terminal_consumed_by_stage = true;
+                    break;
+                }
+            }
         }
 
         if let Some(enc) = encoder {
             let abort_e = abort.clone();
             let counters_e = counters.clone();
-            let out_tx = out_tx.clone();
+            let terminal = terminal.take().expect("encoder track terminal");
+            let upstream = upstream.take().expect("encoder input receiver");
             let name = format!("encode-{track_idx}");
             handles.push(spawn_stage(
                 abort_e,
                 name,
                 FailureStage::Encode,
                 Some(track_idx as u32),
-                move |abort| {
-                    run_encode_stage(
-                        enc,
-                        upstream,
-                        out_tx,
-                        track_idx as u32,
-                        kind,
-                        abort,
-                        counters_e,
-                    )
-                },
+                move |abort| run_encode_stage(enc, upstream, terminal, abort, counters_e),
             ));
-        } else {
-            // No encoder — raw frames flow into the mux (player
-            // scenario). The fanout only forwards; it has no failure
-            // mode of its own, so any (future) error is closest to the
-            // sink side.
+        } else if !terminal_consumed_by_stage {
+            // Frame-shape source with no later stage: the small per-track input
+            // queue is a genuine source-fanout boundary, but the terminal worker
+            // delivers directly to TrackSink / aggregate output with no second
+            // final-output queue.
             let abort_r = abort.clone();
-            let out_tx = out_tx.clone();
-            let name = format!("frame-fanout-{track_idx}");
+            let counters_r = counters.clone();
+            let terminal = terminal.take().expect("frame source track terminal");
+            let upstream = upstream.take().expect("frame terminal input receiver");
+            let name = format!("frame-terminal-{track_idx}");
             handles.push(spawn_stage(
                 abort_r,
                 name,
                 FailureStage::Sink,
                 Some(track_idx as u32),
-                move |abort| run_frame_fanout(upstream, out_tx, track_idx as u32, kind, abort),
+                move |abort| run_frame_fanout(upstream, terminal, abort, counters_r),
             ));
         }
     }
-
-    // Drop the master copies of the output channels; only workers hold
-    // senders now so `recv_timeout` sees RecvTimeoutError::Disconnected
-    // when every stage has finished.
-    drop(track_output_tx);
 
     // Spawn one source-pump thread per URI, shaped by the source kind:
     // bytes-shape URIs get the demuxer stage, packet-shape URIs get the
@@ -1038,153 +1333,164 @@ pub(crate) fn run_pipelined_inner(
         }
     }
 
-    // Mux loop on the caller thread — drain across every track output
-    // channel until all are EOF or abort is set.
-    //
-    // Pre-fix this used a per-track `recv_timeout(50ms)` round-robin: when
-    // one track was empty, the mux blocked 50 ms on it before checking the
-    // next, even if the next had data ready. With audio + video tracks
-    // running in parallel and the slower decoder running ~one frame per
-    // packet, the empty-track stall throttled the *full* track to ~1
-    // message per 50 ms (~20 msg/s). On `solana-ad.mp4` that surfaced as
-    // audio-ring drain during real playback: `--vo winit+wgpu --ao auto`
-    // saw the audio queue collapse from ~1 s to ~0 s within five seconds.
-    //
-    // The new shape is a non-blocking round-robin: each pass calls
-    // `try_recv` on every track in turn, processing whatever is ready.
-    // When *every* track is empty AND none have disconnected, park briefly
-    // (1 ms) so we don't spin a CPU. EOF and disconnection are still
-    // counted as terminal exactly as before. This keeps fast-track
-    // throughput bounded only by the receive + sink-write cost, not by
-    // any sibling track's idleness.
-    let mut eof_state: Vec<bool> = vec![false; track_output_rx.len()];
-    let mut eof_count = 0usize;
-    let total = track_output_rx.len();
-    while eof_count < total {
-        if abort.is_aborted() {
-            break;
+    if independent_delivery {
+        // Track terminal workers own their TrackSinks directly. There is no
+        // mux-end receiver to drain or drop; wait for the graph to finish.
+        // On error/external stop the shared cancellation token wakes blocking
+        // TrackSinks, whose exit drops their upstream receivers and lets the
+        // bounded-channel backpressure unwind towards the source.
+        for h in handles {
+            let _ = h.join();
         }
-        let mut made_progress = false;
-        for i in 0..total {
-            if eof_state[i] {
-                continue;
+    } else {
+        // Mux loop on the caller thread — drain across every track output
+        // channel until all are EOF or abort is set.
+        //
+        // Pre-fix this used a per-track `recv_timeout(50ms)` round-robin: when
+        // one track was empty, the mux blocked 50 ms on it before checking the
+        // next, even if the next had data ready. With audio + video tracks
+        // running in parallel and the slower decoder running ~one frame per
+        // packet, the empty-track stall throttled the *full* track to ~1
+        // message per 50 ms (~20 msg/s). On `solana-ad.mp4` that surfaced as
+        // audio-ring drain during real playback: `--vo winit+wgpu --ao auto`
+        // saw the audio queue collapse from ~1 s to ~0 s within five seconds.
+        //
+        // The new shape is a non-blocking round-robin: each pass calls
+        // `try_recv` on every track in turn, processing whatever is ready.
+        // When *every* track is empty AND none have disconnected, park briefly
+        // (1 ms) so we don't spin a CPU. EOF and disconnection are still
+        // counted as terminal exactly as before. This keeps fast-track
+        // throughput bounded only by the receive + sink-write cost, not by
+        // any sibling track's idleness.
+        let mut eof_state: Vec<bool> = vec![false; track_output_rx.len()];
+        let mut eof_count = 0usize;
+        let total = track_output_rx.len();
+        while eof_count < total {
+            if abort.is_aborted() {
+                break;
             }
-            let rx = &track_output_rx[i];
-            match rx.try_recv() {
-                Ok(Msg::Data(item)) => {
-                    made_progress = true;
-                    let pts = match &item.payload {
-                        OutputPayload::Packet(p) => p.pts,
-                        OutputPayload::Frame(f) => f.pts(),
-                    };
-                    match item.payload {
-                        OutputPayload::Packet(mut p) => {
-                            p.stream_index = item.track_index;
-                            if let Err(e) = sink.write_packet(item.kind, &p) {
-                                abort.record_failure(StageFailure::new(
-                                    FailureStage::Sink,
-                                    Some(item.track_index),
-                                    e,
-                                ));
-                                break;
+            let mut made_progress = false;
+            for i in 0..total {
+                if eof_state[i] {
+                    continue;
+                }
+                let rx = &track_output_rx[i];
+                match rx.try_recv() {
+                    Ok(Msg::Data(item)) => {
+                        made_progress = true;
+                        let pts = match &item.payload {
+                            OutputPayload::Packet(p) => p.pts,
+                            OutputPayload::Frame(f) => f.pts(),
+                        };
+                        match item.payload {
+                            OutputPayload::Packet(mut p) => {
+                                p.stream_index = item.track_index;
+                                if let Err(e) = sink.write_packet(item.kind, &p) {
+                                    abort.record_failure(StageFailure::new(
+                                        FailureStage::Sink,
+                                        Some(item.track_index),
+                                        e,
+                                    ));
+                                    break;
+                                }
+                            }
+                            OutputPayload::Frame(f) => {
+                                if let Err(e) = sink.write_frame_lease(item.kind, f) {
+                                    abort.record_failure(StageFailure::new(
+                                        FailureStage::Sink,
+                                        Some(item.track_index),
+                                        e,
+                                    ));
+                                    break;
+                                }
+                                counters.frames_written.fetch_add(1, Ordering::SeqCst);
                             }
                         }
-                        OutputPayload::Frame(f) => {
-                            if let Err(e) = sink.write_frame_lease(item.kind, f) {
-                                abort.record_failure(StageFailure::new(
-                                    FailureStage::Sink,
-                                    Some(item.track_index),
-                                    e,
-                                ));
-                                break;
-                            }
-                            counters.frames_written.fetch_add(1, Ordering::SeqCst);
+                        if let Some(tx) = &progress_tx {
+                            let frames = counters.frames_written.load(Ordering::SeqCst);
+                            let skipped = counters.packets_skipped.load(Ordering::SeqCst);
+                            let read = counters.packets_read.load(Ordering::SeqCst);
+                            let encoded = counters.packets_encoded.load(Ordering::SeqCst);
+                            let copied = counters.packets_copied.load(Ordering::SeqCst);
+                            let _ = tx.try_send(Progress {
+                                pts,
+                                frames,
+                                eof: false,
+                                queue_bytes: budget.in_flight(),
+                                elapsed_micros: started_at.elapsed().as_micros() as u64,
+                                packets_skipped: skipped,
+                                packets_read: read,
+                                packets_encoded: encoded,
+                                packets_copied: copied,
+                            });
                         }
                     }
-                    if let Some(tx) = &progress_tx {
-                        let frames = counters.frames_written.load(Ordering::SeqCst);
-                        let skipped = counters.packets_skipped.load(Ordering::SeqCst);
-                        let read = counters.packets_read.load(Ordering::SeqCst);
-                        let encoded = counters.packets_encoded.load(Ordering::SeqCst);
-                        let copied = counters.packets_copied.load(Ordering::SeqCst);
-                        let _ = tx.try_send(Progress {
-                            pts,
-                            frames,
-                            eof: false,
-                            queue_bytes: budget.in_flight(),
-                            elapsed_micros: started_at.elapsed().as_micros() as u64,
-                            packets_skipped: skipped,
-                            packets_read: read,
-                            packets_encoded: encoded,
-                            packets_copied: copied,
-                        });
+                    Ok(Msg::StreamUpdate(stream)) => {
+                        made_progress = true;
+                        if let Err(e) = sink.stream_update(&stream) {
+                            abort.record_failure(StageFailure::new(
+                                FailureStage::Sink,
+                                Some(stream.index),
+                                e,
+                            ));
+                            break;
+                        }
                     }
-                }
-                Ok(Msg::StreamUpdate(stream)) => {
-                    made_progress = true;
-                    if let Err(e) = sink.stream_update(&stream) {
-                        abort.record_failure(StageFailure::new(
-                            FailureStage::Sink,
-                            Some(stream.index),
-                            e,
-                        ));
-                        break;
+                    Ok(Msg::Barrier(kind)) => {
+                        made_progress = true;
+                        if let Err(e) = sink.barrier(kind) {
+                            abort.record_failure(StageFailure::new(
+                                FailureStage::Sink,
+                                Some(i as u32),
+                                e,
+                            ));
+                            break;
+                        }
                     }
-                }
-                Ok(Msg::Barrier(kind)) => {
-                    made_progress = true;
-                    if let Err(e) = sink.barrier(kind) {
-                        abort.record_failure(StageFailure::new(
-                            FailureStage::Sink,
-                            Some(i as u32),
-                            e,
-                        ));
-                        break;
+                    Ok(Msg::Eof) => {
+                        made_progress = true;
+                        if !eof_state[i] {
+                            eof_state[i] = true;
+                            eof_count += 1;
+                        }
                     }
-                }
-                Ok(Msg::Eof) => {
-                    made_progress = true;
-                    if !eof_state[i] {
-                        eof_state[i] = true;
-                        eof_count += 1;
+                    Err(mpsc::TryRecvError::Empty) => {
+                        // Try the next track; if all are empty we'll park
+                        // briefly below.
                     }
-                }
-                Err(mpsc::TryRecvError::Empty) => {
-                    // Try the next track; if all are empty we'll park
-                    // briefly below.
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    // Producer panicked or exited without sending Eof —
-                    // count as EOF to avoid hanging. Any error was
-                    // already recorded on the abort state.
-                    if !eof_state[i] {
-                        eof_state[i] = true;
-                        eof_count += 1;
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        // Producer panicked or exited without sending Eof —
+                        // count as EOF to avoid hanging. Any error was
+                        // already recorded on the abort state.
+                        if !eof_state[i] {
+                            eof_state[i] = true;
+                            eof_count += 1;
+                        }
                     }
                 }
             }
+            if !made_progress && eof_count < total {
+                // Every track was empty this pass — park 1 ms so we don't
+                // spin a CPU core while waiting for upstream stages.
+                thread::sleep(Duration::from_millis(1));
+            }
         }
-        if !made_progress && eof_count < total {
-            // Every track was empty this pass — park 1 ms so we don't
-            // spin a CPU core while waiting for upstream stages.
-            thread::sleep(Duration::from_millis(1));
-        }
-    }
 
-    // Drain abort flag + wait for workers regardless of exit path.
-    abort.request_abort();
-    // Drop the mux-end receivers BEFORE joining workers. Upstream
-    // stages (copy / decode / filter / pix-convert / demux) may be
-    // blocked inside `SyncSender::send()` because the bounded
-    // channel is full — setting the abort flag alone doesn't wake
-    // them. Dropping the receivers turns every pending send into an
-    // `Err(SendError)`, the worker's `tx.send().is_err()` branch
-    // breaks its loop, and the cascade propagates up to the demuxer.
-    // Without this, `h.join()` below deadlocks on any abort-path
-    // exit (quit event, sink error, encoder fail).
-    drop(track_output_rx);
-    for h in handles {
-        let _ = h.join();
+        // Drain abort flag + wait for workers regardless of exit path.
+        abort.request_abort();
+        // Drop the mux-end receivers BEFORE joining workers. Upstream
+        // stages (copy / decode / filter / pix-convert / demux) may be
+        // blocked inside `SyncSender::send()` because the bounded
+        // channel is full — setting the abort flag alone doesn't wake
+        // them. Dropping the receivers turns every pending send into an
+        // `Err(SendError)`, the worker's `tx.send().is_err()` branch
+        // breaks its loop, and the cascade propagates up to the demuxer.
+        // Without this, `h.join()` below deadlocks on any abort-path
+        // exit (quit event, sink error, encoder fail).
+        drop(track_output_rx);
+        for h in handles {
+            let _ = h.join();
+        }
     }
     if let Some(mut failure) = abort.take_failure() {
         // Attach the partial counters: workers have joined, so the
@@ -1593,12 +1899,10 @@ fn run_frame_source_stage(
     Ok(())
 }
 
-/// Copy track: packets straight to the output channel.
+/// Copy track: packets straight to its terminal sink.
 fn run_copy_stage(
     rx: Receiver<Msg<Packet>>,
-    out_tx: SyncSender<Msg<OutputItem>>,
-    track_index: u32,
-    kind: MediaType,
+    mut terminal: TrackTerminal,
     abort: Arc<AbortState>,
     counters: Arc<PipelineCounters>,
     budget: Arc<QueueBudget>,
@@ -1609,86 +1913,52 @@ fn run_copy_stage(
         }
         match rx.recv() {
             Ok(Msg::Data(pkt)) => {
-                // The packet has left the demuxer→worker channel; release
-                // its bytes from the in-flight budget the instant we own
-                // it (before the possibly-blocking output send) so the
-                // demuxer can advance as soon as the channel drains.
                 budget.release(pkt.data.len() as u64);
-                if out_tx
-                    .send(Msg::Data(OutputItem {
-                        track_index,
-                        kind,
-                        payload: OutputPayload::Packet(pkt),
-                    }))
-                    .is_err()
-                {
-                    break;
-                }
-                counters.packets_copied.fetch_add(1, Ordering::SeqCst);
-            }
-            Ok(Msg::StreamUpdate(_)) => {
-                // Packet sources never emit decoder-format updates.
-            }
-            Ok(Msg::Barrier(b)) => {
-                // Copy stages have no internal state — just forward.
-                if out_tx.send(Msg::Barrier(b)).is_err() {
-                    break;
+                match terminal.write_packet(pkt) {
+                    Ok(DeliveryStatus::Delivered) => {
+                        counters.packets_copied.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Ok(DeliveryStatus::Closed) => {
+                        abort.request_abort();
+                        break;
+                    }
+                    Err(e) if e.is_cancelled() && abort.is_aborted() => break,
+                    Err(e) => return Err(e),
                 }
             }
+            Ok(Msg::StreamUpdate(_)) => {}
+            Ok(Msg::Barrier(b)) => match terminal.barrier(b) {
+                Ok(DeliveryStatus::Delivered) => {}
+                Ok(DeliveryStatus::Closed) => {
+                    abort.request_abort();
+                    break;
+                }
+                Err(e) if e.is_cancelled() && abort.is_aborted() => break,
+                Err(e) => return Err(e),
+            },
             Ok(Msg::Eof) | Err(_) => break,
         }
     }
-    let _ = out_tx.send(Msg::Eof);
+    terminal.eof();
     Ok(())
 }
-
-/// Decoder stage: packets -> frames.
+/// Decoder stage: packets -> frames or directly into the track terminal.
 fn run_decode_stage(
     mut decoder: Box<dyn Decoder>,
     rx: Receiver<Msg<Packet>>,
-    tx: SyncSender<Msg<FrameLease>>,
+    mut downstream: FrameDownstream,
     mut stream_template: Option<StreamInfo>,
     abort: Arc<AbortState>,
     counters: Arc<PipelineCounters>,
     budget: Arc<QueueBudget>,
 ) -> Result<()> {
     let mut last_stream_params: Option<CodecParameters> = None;
-    // Stream frames through `tx` as they're produced rather than
-    // collecting into a `Vec` first. Bounded `tx.send` provides natural
-    // back-pressure: once the downstream stage is full, send blocks and
-    // the decoder is held off until the sink catches up.
-    //
-    // The previous "drain-then-send" shape was a structural hazard for
-    // streaming codecs that emit far more than one frame per packet
-    // (MOD / S3M / XM tracker codecs deliver the whole file in a single
-    // packet and then synthesise frames continuously until the song
-    // ends — or, for songs with a Bxx position-loop at the end, never).
-    // Buffering the entire emission into a Vec deferred the first
-    // downstream send until decode finished; for an infinite-loop song
-    // the player never started.
-    // Tolerance bookkeeping: a single per-packet decode glitch (e.g.
-    // an AAC frame where the bit-stream has a recoverable parse error)
-    // must NOT abort the entire stream. Real-world playback expects a
-    // single corrupted packet to mean a single skipped frame rather
-    // than a wedged player; the H.264 decoder in this workspace
-    // already follows this pattern internally
-    // (`eprintln!("h264 slice skipped: {e}")`). Pre-fix the audio
-    // path here would `return Err(e)` on the first transient codec
-    // error and kill the entire stream — the user-reported
-    // congress_mtgox_coins.mp4 hang at 00:00 was exactly that: AAC
-    // packet #3 returned an "out of bits" error after producing 2
-    // frames, the executor exited the worker, the engine never got
-    // any further frames, the audio clock never advanced.
     'outer: loop {
         if abort.is_aborted() {
             break;
         }
         match rx.recv() {
             Ok(Msg::Data(pkt)) => {
-                // Release the packet's bytes from the in-flight budget as
-                // soon as it leaves the demuxer→worker channel — before
-                // `send_packet` and before the per-packet skip branch, so
-                // a skipped packet still frees its budget slot.
                 budget.release(pkt.data.len() as u64);
                 if let Err(e) = decoder.send_packet(&pkt) {
                     if e.is_cancelled() && abort.is_aborted() {
@@ -1713,16 +1983,13 @@ fn run_decode_stage(
                         .map_or(true, |last| !last.matches_core(params));
                     if changed {
                         template.params = params.clone();
-                        if tx
-                            .send(Msg::StreamUpdate(Box::new(template.clone())))
-                            .is_err()
-                        {
-                            abort.request_abort();
+                        if !deliver_stream_update(&mut downstream, template.clone(), &abort)? {
                             break 'outer;
                         }
                         last_stream_params = Some(params.clone());
                     }
                 }
+
                 let mut produced_any = false;
                 loop {
                     if abort.is_aborted() {
@@ -1732,33 +1999,14 @@ fn run_decode_stage(
                         Ok(frame) => {
                             counters.frames_decoded.fetch_add(1, Ordering::SeqCst);
                             produced_any = true;
-                            if tx.send(Msg::Data(frame)).is_err() {
-                                abort.request_abort();
+                            if !deliver_frame_downstream(&mut downstream, frame, &abort, &counters)?
+                            {
                                 break 'outer;
                             }
                         }
                         Err(Error::NeedMore) => break,
                         Err(Error::Eof) => break 'outer,
                         Err(e) => {
-                            // Per-packet decode error: log + try the next
-                            // packet. The decoder is responsible for
-                            // self-resyncing (clearing its internal
-                            // pending state when receive_frame errors —
-                            // see oxideav-aac decode_packet.rs). If a
-                            // codec is genuinely broken every packet
-                            // will surface this and the stream will
-                            // stay silent / black, which is better
-                            // than a wedged player.
-                            //
-                            // Count as `packets_skipped` only when the
-                            // packet yielded no frames at all. A failure
-                            // *after* one or more frames already streamed
-                            // is end-of-output for this packet (partial
-                            // output landed — the packet wasn't lost), and
-                            // counting it would inflate the skip count
-                            // relative to what the user-facing symptom
-                            // actually is. Mirrors the inherent path in
-                            // `executor.rs::pump_packet`.
                             if !produced_any {
                                 counters.packets_skipped.fetch_add(1, Ordering::SeqCst);
                             }
@@ -1771,22 +2019,12 @@ fn run_decode_stage(
                     }
                 }
             }
-            Ok(Msg::StreamUpdate(_)) => {
-                // Decoder input is compressed packets; format updates only
-                // originate from this stage, never upstream of it.
-            }
+            Ok(Msg::StreamUpdate(_)) => {}
             Ok(Msg::Barrier(b)) => {
-                // SeekFlush: drop any in-flight buffered frames + reset
-                // codec state so reference frames from the pre-seek
-                // segment can't leak into the post-seek output.
-                // SeekRejected: demuxer never moved; the in-flight
-                // packets are still on the original timeline, so
-                // leave decoder state alone and only forward the
-                // barrier so the engine sees it.
                 if matches!(b, BarrierKind::SeekFlush { .. }) {
                     let _ = decoder.reset();
                 }
-                if tx.send(Msg::Barrier(b)).is_err() {
+                if !deliver_frame_barrier(&mut downstream, b, &abort)? {
                     break;
                 }
             }
@@ -1801,7 +2039,8 @@ fn run_decode_stage(
                     match decoder.receive_frame_lease() {
                         Ok(frame) => {
                             counters.frames_decoded.fetch_add(1, Ordering::SeqCst);
-                            if tx.send(Msg::Data(frame)).is_err() {
+                            if !deliver_frame_downstream(&mut downstream, frame, &abort, &counters)?
+                            {
                                 break 'outer;
                             }
                         }
@@ -1817,25 +2056,21 @@ fn run_decode_stage(
             Err(_) => break,
         }
     }
-    let _ = tx.send(Msg::Eof);
+    downstream.eof();
     Ok(())
 }
 
 /// Frame-stage worker: consumes frames, runs them through an audio
-/// filter or pixel-format conversion, and forwards to the next stage.
-/// Used for both `FrameStage::Filter` and `FrameStage::PixConvert`.
-///
-/// If the stage is a multi-port filter, per-extra-port frames are sent
-/// straight to the output channel tagged with the extra stream's
-/// global index (starting at `extras_base`) — they bypass the rest of
-/// the frame-stage chain and land on the sink directly.
+/// filter or pixel-format conversion, and forwards to the next stage or,
+/// when terminal, directly to the track sink.
 fn run_frame_stage_worker(
     mut stage: FrameStage,
     rx: Receiver<Msg<FrameLease>>,
-    tx: SyncSender<Msg<FrameLease>>,
+    mut downstream: FrameDownstream,
     extras_tx: Option<SyncSender<Msg<OutputItem>>>,
     extras_base: u32,
     abort: Arc<AbortState>,
+    counters: Arc<PipelineCounters>,
 ) -> Result<()> {
     loop {
         if abort.is_aborted() {
@@ -1843,41 +2078,29 @@ fn run_frame_stage_worker(
         }
         match rx.recv() {
             Ok(Msg::Data(lease)) => {
-                // Filters and pixel conversion still use the legacy Frame API;
-                // materialise precisely when the lease enters such a stage.
                 let frame = lease.into_frame()?;
                 let emissions = run_frame_stage_emit(&mut stage, frame)?;
                 dispatch_extras(emissions.extras, &extras_tx, extras_base, &abort);
                 for frame in emissions.primary {
-                    if tx.send(Msg::Data(FrameLease::from_frame(frame))).is_err() {
-                        abort.request_abort();
+                    if !deliver_frame_downstream(
+                        &mut downstream,
+                        FrameLease::from_frame(frame),
+                        &abort,
+                        &counters,
+                    )? {
                         break;
                     }
                 }
             }
-            Ok(Msg::StreamUpdate(_)) => {
-                // Direct decoder-format updates are only enabled when there
-                // are no frame-transform stages, because a filter may change
-                // the output shape and would need to publish its own format.
-            }
+            Ok(Msg::StreamUpdate(_)) => {}
             Ok(Msg::Barrier(b)) => {
-                // Filter stages may hold rolling-window state (spectrogram
-                // columns, resampler tail) — drop it. Pixel-format
-                // converts are stateless so they no-op. The barrier also
-                // flows to the extras channel so a multi-port filter's
-                // sink (e.g. spectrogram's video output) gets a chance
-                // to drop in-flight extras.
-                //
-                // SeekRejected: demuxer never moved, so the filter's
-                // rolling state is still consistent with the upstream
-                // frames in flight; only forward the barrier.
                 if matches!(b, BarrierKind::SeekFlush { .. }) {
                     reset_frame_stage(&mut stage);
                 }
                 if let Some(etx) = &extras_tx {
                     let _ = etx.send(Msg::Barrier(b));
                 }
-                if tx.send(Msg::Barrier(b)).is_err() {
+                if !deliver_frame_barrier(&mut downstream, b, &abort)? {
                     break;
                 }
             }
@@ -1885,14 +2108,21 @@ fn run_frame_stage_worker(
                 let emissions = flush_frame_stage_emit(&mut stage)?;
                 dispatch_extras(emissions.extras, &extras_tx, extras_base, &abort);
                 for frame in emissions.primary {
-                    let _ = tx.send(Msg::Data(FrameLease::from_frame(frame)));
+                    if !deliver_frame_downstream(
+                        &mut downstream,
+                        FrameLease::from_frame(frame),
+                        &abort,
+                        &counters,
+                    )? {
+                        break;
+                    }
                 }
                 break;
             }
             Err(_) => break,
         }
     }
-    let _ = tx.send(Msg::Eof);
+    downstream.eof();
     Ok(())
 }
 
@@ -1939,13 +2169,11 @@ fn dispatch_extras(
     }
 }
 
-/// Encoder stage: frames -> packets -> OutputItem.
+/// Encoder stage: frames -> packets -> terminal sink.
 fn run_encode_stage(
     mut encoder: Box<dyn Encoder>,
     rx: Receiver<Msg<FrameLease>>,
-    out_tx: SyncSender<Msg<OutputItem>>,
-    track_index: u32,
-    kind: MediaType,
+    mut terminal: TrackTerminal,
     abort: Arc<AbortState>,
     counters: Arc<PipelineCounters>,
 ) -> Result<()> {
@@ -1957,107 +2185,95 @@ fn run_encode_stage(
             Ok(Msg::Data(lease)) => {
                 let frame = lease.into_frame()?;
                 encoder.send_frame(&frame)?;
-                drain_and_send(encoder.as_mut(), &out_tx, track_index, kind, &counters)?;
+                if !drain_and_send(encoder.as_mut(), &mut terminal, &abort, &counters)? {
+                    break;
+                }
             }
-            Ok(Msg::StreamUpdate(_)) => {
-                // Decoder-format updates are not enabled on encoded routes;
-                // the encoder owns the sink-facing output parameters.
-            }
+            Ok(Msg::StreamUpdate(_)) => {}
             Ok(Msg::Barrier(b)) => {
-                // The encoder trait has no `reset()` today — flush
-                // anything pending and forward the barrier. A future
-                // extension can plumb codec-specific reset (e.g.
-                // dropping the GOP) once needed.
-                //
-                // SeekRejected: demuxer never moved; skip the flush
-                // (which would emit a partial GOP for nothing) and
-                // only forward the barrier.
                 if matches!(b, BarrierKind::SeekFlush { .. }) {
                     let _ = encoder.flush();
-                    drain_and_send(encoder.as_mut(), &out_tx, track_index, kind, &counters)?;
+                    if !drain_and_send(encoder.as_mut(), &mut terminal, &abort, &counters)? {
+                        break;
+                    }
                 }
-                if out_tx.send(Msg::Barrier(b)).is_err() {
-                    break;
+                match terminal.barrier(b) {
+                    Ok(DeliveryStatus::Delivered) => {}
+                    Ok(DeliveryStatus::Closed) => {
+                        abort.request_abort();
+                        break;
+                    }
+                    Err(e) if e.is_cancelled() && abort.is_aborted() => break,
+                    Err(e) => return Err(e),
                 }
             }
             Ok(Msg::Eof) => {
                 encoder.flush()?;
-                drain_and_send(encoder.as_mut(), &out_tx, track_index, kind, &counters)?;
+                let _ = drain_and_send(encoder.as_mut(), &mut terminal, &abort, &counters)?;
                 break;
             }
             Err(_) => break,
         }
     }
-    let _ = out_tx.send(Msg::Eof);
+    terminal.eof();
     Ok(())
 }
 
-/// Frame fan-out (no encoder): just forwards raw frames to the mux /
-/// sink. Used when the output sink is something like the SDL2 player.
+/// Terminal worker for a frame-shape source with no later processing stage.
 fn run_frame_fanout(
     rx: Receiver<Msg<FrameLease>>,
-    out_tx: SyncSender<Msg<OutputItem>>,
-    track_index: u32,
-    kind: MediaType,
+    terminal: TrackTerminal,
     abort: Arc<AbortState>,
+    counters: Arc<PipelineCounters>,
 ) -> Result<()> {
+    let mut downstream = FrameDownstream::Terminal(terminal);
     loop {
         if abort.is_aborted() {
             break;
         }
         match rx.recv() {
-            Ok(Msg::Data(f)) => {
-                if out_tx
-                    .send(Msg::Data(OutputItem {
-                        track_index,
-                        kind,
-                        payload: OutputPayload::Frame(f),
-                    }))
-                    .is_err()
-                {
+            Ok(Msg::Data(frame)) => {
+                if !deliver_frame_downstream(&mut downstream, frame, &abort, &counters)? {
                     break;
                 }
             }
             Ok(Msg::StreamUpdate(stream)) => {
-                if out_tx.send(Msg::StreamUpdate(stream)).is_err() {
+                if !deliver_stream_update(&mut downstream, *stream, &abort)? {
                     break;
                 }
             }
             Ok(Msg::Barrier(b)) => {
-                if out_tx.send(Msg::Barrier(b)).is_err() {
+                if !deliver_frame_barrier(&mut downstream, b, &abort)? {
                     break;
                 }
             }
             Ok(Msg::Eof) | Err(_) => break,
         }
     }
-    let _ = out_tx.send(Msg::Eof);
+    downstream.eof();
     Ok(())
 }
 
 fn drain_and_send(
     encoder: &mut dyn Encoder,
-    out_tx: &SyncSender<Msg<OutputItem>>,
-    track_index: u32,
-    kind: MediaType,
+    terminal: &mut TrackTerminal,
+    abort: &Arc<AbortState>,
     counters: &PipelineCounters,
-) -> Result<()> {
+) -> Result<bool> {
     loop {
         match encoder.receive_packet() {
-            Ok(p) => {
-                if out_tx
-                    .send(Msg::Data(OutputItem {
-                        track_index,
-                        kind,
-                        payload: OutputPayload::Packet(p),
-                    }))
-                    .is_err()
-                {
-                    return Ok(()); // consumer gone; caller will see abort
+            Ok(packet) => match terminal.write_packet(packet) {
+                Ok(DeliveryStatus::Delivered) => {
+                    counters.packets_encoded.fetch_add(1, Ordering::SeqCst);
                 }
-                counters.packets_encoded.fetch_add(1, Ordering::SeqCst);
-            }
-            Err(Error::NeedMore) | Err(Error::Eof) => return Ok(()),
+                Ok(DeliveryStatus::Closed) => {
+                    abort.request_abort();
+                    return Ok(false);
+                }
+                Err(e) if e.is_cancelled() && abort.is_aborted() => return Ok(false),
+                Err(e) => return Err(e),
+            },
+            Err(Error::NeedMore) | Err(Error::Eof) => return Ok(true),
             Err(e) => return Err(e),
         }
     }
@@ -2324,7 +2540,7 @@ mod tests {
         run_decode_stage(
             decoder,
             packet_rx,
-            frame_tx,
+            FrameDownstream::Channel(frame_tx),
             Some(template),
             abort,
             counters,
@@ -2401,7 +2617,7 @@ mod tests {
             let result = run_decode_stage(
                 decoder,
                 packet_rx,
-                frame_tx,
+                FrameDownstream::Channel(frame_tx),
                 None,
                 worker_abort,
                 counters,

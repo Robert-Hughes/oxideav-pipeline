@@ -113,6 +113,43 @@ fn synth_stream_info(params: &CodecParameters) -> StreamInfo {
     }
 }
 
+/// Metadata for one independently backpressured pipeline track.
+///
+/// A track sink is associated with one primary output stream. Multi-port filter
+/// extras remain on the aggregate JobSink path for now; independent-track mode
+/// is only selected when every pipeline track has exactly one sink-visible
+/// stream.
+#[derive(Clone, Debug)]
+pub struct TrackSinkInfo {
+    pub track_index: u32,
+    pub stream: StreamInfo,
+}
+
+/// Terminal sink for one pipeline track.
+///
+/// Calls are made synchronously by the terminal worker for that track, so
+/// blocking naturally backpressures only that track. Implementations that block
+/// must honour the CancellationToken supplied by JobSink::open_track_sinks so
+/// executor abort can wake the wait and tear the graph down cleanly.
+pub trait TrackSink: Send {
+    fn write_packet(&mut self, stream_index: u32, kind: MediaType, packet: Packet) -> Result<()>;
+
+    fn write_frame_lease(
+        &mut self,
+        stream_index: u32,
+        kind: MediaType,
+        frame: FrameLease,
+    ) -> Result<()>;
+
+    fn stream_update(&mut self, _stream: &StreamInfo) -> Result<()> {
+        Ok(())
+    }
+
+    fn barrier(&mut self, _barrier: crate::BarrierKind) -> Result<()> {
+        Ok(())
+    }
+}
+
 /// A user-installable output sink. Implementations receive either raw
 /// packets (copy path) or decoded frames (transcode path without an
 /// encoder node, e.g. live-play).
@@ -128,6 +165,26 @@ pub trait JobSink {
     /// stream layout is known. Muxer-style sinks usually write the
     /// container header here.
     fn start(&mut self, streams: &[StreamInfo]) -> Result<()>;
+
+    /// Optionally split this output into independently backpressured track
+    /// sinks. The staged runner calls this after start() and before media
+    /// workers begin.
+    ///
+    /// Returning None preserves the aggregate JobSink callbacks below. Returning
+    /// Some requires exactly one TrackSink per TrackSinkInfo, in the same order.
+    /// Each returned sink is moved into that track's terminal worker; there is
+    /// no final OxideAV output queue or central mux callback for those tracks.
+    ///
+    /// The serial executor does not split sinks and continues to use the
+    /// aggregate callbacks.
+    fn open_track_sinks(
+        &mut self,
+        _tracks: &[TrackSinkInfo],
+        _cancellation: oxideav_core::CancellationToken,
+    ) -> Result<Option<Vec<Box<dyn TrackSink + Send>>>> {
+        Ok(None)
+    }
+
     fn write_packet(&mut self, kind: MediaType, pkt: &Packet) -> Result<()>;
     fn write_frame(&mut self, kind: MediaType, frm: &Frame) -> Result<()>;
 
@@ -142,51 +199,25 @@ pub trait JobSink {
         self.write_frame(kind, &frame)
     }
 
-    /// Notify the sink that a decoder has learned authoritative output
-    /// parameters after `start()`. In-band configured codecs such as
-    /// MPEG-TS/ADTS AAC may not know their PCM shape until the first packet
-    /// is decoded. The staged runner orders this update before the first
-    /// frame produced with those parameters.
-    ///
-    /// File/muxer sinks that require a fixed header may keep the default
-    /// no-op; player-style sinks should override this when they configure
-    /// output devices from decoded format metadata.
+    /// Notify the aggregate sink that a decoder has learned authoritative output
+    /// parameters after start(). Independent-track delivery sends this callback
+    /// to the corresponding TrackSink instead.
     fn stream_update(&mut self, _stream: &StreamInfo) -> Result<()> {
         Ok(())
     }
-    /// Drain any remaining internal state and finalise the output.
+
+    /// Drain any remaining internal state and finalise the whole output.
     fn finish(&mut self) -> Result<()>;
 
-    /// Flow-barrier hook. Called by the mux loop when a worker
-    /// forwards a [`crate::BarrierKind`] (today only `SeekFlush`).
-    /// Sinks that buffer frames (a player queueing audio /
-    /// video frames separately) should drop their pre-barrier state
-    /// here so post-barrier frames are presented at the new wall-clock
-    /// position.
-    ///
-    /// Default: no-op — file/null sinks don't buffer anything past the
-    /// muxer's own packet queue.
+    /// Flow-barrier hook for aggregate delivery. Independent-track delivery
+    /// forwards barriers directly to the corresponding TrackSink.
     fn barrier(&mut self, _kind: crate::BarrierKind) -> Result<()> {
         Ok(())
     }
 
-    /// Failed-output disposal hook. Called INSTEAD of [`Self::finish`]
-    /// when the executor was configured with
-    /// [`Executor::with_discard_failed_outputs`]`(true)` and either
-    ///
-    /// * this output's run failed after the sink was resolved, or
-    /// * the sink was resolved for a multi-output wave whose
-    ///   preparation failed before the wave started (the output never
-    ///   ran, but sink resolution may already have created artifacts —
-    ///   e.g. [`crate::FileSink`]'s output file).
-    ///
-    /// Implementations should remove partial artifacts (delete the
-    /// half-written file, drop buffered frames) rather than finalise
-    /// them. NOT called on a clean [`ExecutorHandle::stop`] — a stop
-    /// without a recorded error still finalises via `finish`.
-    ///
-    /// Default: no-op, preserving the historical behaviour for custom
-    /// sinks (partial output is simply left wherever the sink put it).
+    /// Failed-output disposal hook. Called INSTEAD of Self::finish when the
+    /// executor was configured with discard_failed_outputs and this output
+    /// fails. Disposal errors never mask the original failure.
     fn abandon(&mut self) -> Result<()> {
         Ok(())
     }

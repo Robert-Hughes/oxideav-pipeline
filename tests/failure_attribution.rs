@@ -25,11 +25,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use oxideav_core::{
-    registry::CodecInfo, AudioFrame, CodecCapabilities, CodecId, CodecParameters, Encoder,
-    EncoderFactory, Error, FilterContext, Frame, FrameSource, MediaType, Packet, PortSpec, Result,
-    RuntimeContext, SampleFormat, StreamFilter, StreamInfo,
+    registry::CodecInfo, AudioFrame, CancellationToken, CodecCapabilities, CodecId,
+    CodecParameters, Encoder, EncoderFactory, Error, FilterContext, Frame, FrameLease, FrameSource,
+    MediaType, Packet, PortSpec, Result, RuntimeContext, SampleFormat, StreamFilter, StreamInfo,
 };
-use oxideav_pipeline::{Executor, FailureStage, Job, JobSink, RunFailure};
+use oxideav_pipeline::{
+    Executor, FailureStage, Job, JobSink, RunFailure, TrackSink, TrackSinkInfo,
+};
 
 const FILTER_ERR: &str = "attribution test filter deliberately failed";
 const ENC_SEND_ERR: &str = "attribution test encoder send deliberately failed";
@@ -744,6 +746,95 @@ fn second_track_failure_attributes_track_one() {
             ENC_SEND_ERR,
         );
     }
+}
+
+#[test]
+fn independent_track_sink_failure_attributes_to_sink_stage_with_track() {
+    const TRACK_SINK_ERR: &str = "independent TrackSink deliberately failed";
+
+    struct FailingTrackSink;
+
+    impl TrackSink for FailingTrackSink {
+        fn write_packet(
+            &mut self,
+            _stream_index: u32,
+            _kind: MediaType,
+            _packet: Packet,
+        ) -> Result<()> {
+            Err(Error::other("unexpected packet callback"))
+        }
+
+        fn write_frame_lease(
+            &mut self,
+            _stream_index: u32,
+            _kind: MediaType,
+            _frame: FrameLease,
+        ) -> Result<()> {
+            Err(Error::other(TRACK_SINK_ERR))
+        }
+    }
+
+    struct IndependentFaultSink;
+
+    impl JobSink for IndependentFaultSink {
+        fn start(&mut self, _streams: &[StreamInfo]) -> Result<()> {
+            Ok(())
+        }
+
+        fn open_track_sinks(
+            &mut self,
+            tracks: &[TrackSinkInfo],
+            _cancellation: CancellationToken,
+        ) -> Result<Option<Vec<Box<dyn TrackSink + Send>>>> {
+            assert_eq!(tracks.len(), 1);
+            Ok(Some(vec![Box::new(FailingTrackSink)]))
+        }
+
+        fn write_packet(&mut self, _kind: MediaType, _packet: &Packet) -> Result<()> {
+            Err(Error::other("aggregate packet callback must not run"))
+        }
+
+        fn write_frame(&mut self, _kind: MediaType, _frame: &Frame) -> Result<()> {
+            Err(Error::other("aggregate frame callback must not run"))
+        }
+
+        fn finish(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    let src = common::stub::touch("attr_independent_track_sink");
+    let job_json = format!(
+        r#"{{"@display": {{"audio": [{{"from": "{}"}}]}}}}"#,
+        json_path(&src)
+    );
+    let ctx = attr_ctx();
+    let job = Job::from_json(&job_json).expect("parse job");
+    let handle = Executor::new(&job, &ctx)
+        .with_threads(2)
+        .with_sink_override("@display", Box::new(IndependentFaultSink))
+        .spawn()
+        .expect("spawn");
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !handle.has_finished() {
+        assert!(
+            Instant::now() < deadline,
+            "executor did not observe independent TrackSink failure in time"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let failure = handle
+        .stop_reporting()
+        .expect_err("independent TrackSink failure must surface");
+    assert_failure(
+        &failure,
+        Some("@display"),
+        FailureStage::Sink,
+        Some(0),
+        TRACK_SINK_ERR,
+    );
 }
 
 /// The mux loop's `sink.barrier` record site: a sink that errors on

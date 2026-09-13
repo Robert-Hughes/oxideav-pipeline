@@ -27,12 +27,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use oxideav_core::{
-    packet::PacketFlags, AudioFrame, CodecCapabilities, CodecId, CodecParameters, Decoder,
-    DecoderFactory, Error, Frame, FrameSource, MediaType, Packet, PacketSource, Result,
-    RuntimeContext, SampleFormat, StreamInfo, TimeBase,
+    packet::PacketFlags, AudioFrame, CancellationToken, CodecCapabilities, CodecId,
+    CodecParameters, Decoder, DecoderFactory, Error, Frame, FrameLease, FrameSource, MediaType,
+    Packet, PacketSource, Result, RuntimeContext, SampleFormat, StreamInfo, TimeBase,
 };
 use oxideav_core::{registry::CodecInfo, CodecRegistry};
-use oxideav_pipeline::{BarrierKind, Executor, Job, JobSink};
+use oxideav_pipeline::{BarrierKind, Executor, Job, JobSink, TrackSink, TrackSinkInfo};
 
 const CODEC: &str = "typed_staged_pcm";
 const SAMPLE_RATE: u32 = 8_000;
@@ -228,6 +228,107 @@ impl JobSink for ChannelSink {
     }
 }
 
+struct BlockingTrackSink {
+    cancellation: CancellationToken,
+}
+
+impl TrackSink for BlockingTrackSink {
+    fn write_packet(
+        &mut self,
+        _stream_index: u32,
+        _kind: MediaType,
+        _packet: Packet,
+    ) -> Result<()> {
+        Err(Error::unsupported("test sink expects decoded frames"))
+    }
+
+    fn write_frame_lease(
+        &mut self,
+        _stream_index: u32,
+        _kind: MediaType,
+        _frame: FrameLease,
+    ) -> Result<()> {
+        while !self.cancellation.is_cancelled() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        Err(Error::cancelled("test TrackSink cancelled"))
+    }
+}
+
+struct ObservingTrackSink {
+    tx: SyncSender<u32>,
+}
+
+impl TrackSink for ObservingTrackSink {
+    fn write_packet(
+        &mut self,
+        _stream_index: u32,
+        _kind: MediaType,
+        _packet: Packet,
+    ) -> Result<()> {
+        Err(Error::unsupported("test sink expects decoded frames"))
+    }
+
+    fn write_frame_lease(
+        &mut self,
+        stream_index: u32,
+        _kind: MediaType,
+        _frame: FrameLease,
+    ) -> Result<()> {
+        self.tx
+            .send(stream_index)
+            .map_err(|_| Error::other("observer receiver dropped"))
+    }
+}
+
+struct IndependentTrackJobSink {
+    observed_tx: SyncSender<u32>,
+}
+
+impl JobSink for IndependentTrackJobSink {
+    fn start(&mut self, _streams: &[StreamInfo]) -> Result<()> {
+        Ok(())
+    }
+
+    fn open_track_sinks(
+        &mut self,
+        tracks: &[TrackSinkInfo],
+        cancellation: CancellationToken,
+    ) -> Result<Option<Vec<Box<dyn TrackSink + Send>>>> {
+        assert_eq!(tracks.len(), 2);
+        Ok(Some(vec![
+            Box::new(BlockingTrackSink {
+                cancellation: cancellation.clone(),
+            }),
+            Box::new(ObservingTrackSink {
+                tx: self.observed_tx.clone(),
+            }),
+        ]))
+    }
+
+    fn write_packet(&mut self, _kind: MediaType, _pkt: &Packet) -> Result<()> {
+        Err(Error::other(
+            "aggregate JobSink packet callback must not be used in TrackSink mode",
+        ))
+    }
+
+    fn write_frame(&mut self, _kind: MediaType, _frm: &Frame) -> Result<()> {
+        Err(Error::other(
+            "aggregate JobSink frame callback must not be used in TrackSink mode",
+        ))
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+fn dual_display_job(uri: &str) -> Job {
+    let job_json =
+        format!(r#"{{"@display": {{"audio": [{{"from": "{uri}"}}, {{"from": "{uri}"}}]}}}}"#);
+    Job::from_json(&job_json).expect("parse dual-track job")
+}
+
 fn display_job(uri: &str) -> Job {
     let job_json = format!(r#"{{"@display": {{"audio": [{{"from": "{uri}"}}]}}}}"#);
     Job::from_json(&job_json).expect("parse job")
@@ -314,6 +415,34 @@ fn spawn_packet_source_runs_decode_chain() {
     assert_eq!(stats.packets_read, FINITE_LEN);
     assert_eq!(stats.frames_decoded, FINITE_LEN);
     assert_eq!(stats.frames_written, FINITE_LEN);
+}
+
+#[test]
+fn independent_track_sinks_keep_sibling_track_moving_under_backpressure() {
+    let ctx = make_ctx();
+    let job = dual_display_job("tspkt://live");
+    let (observed_tx, observed_rx) = mpsc::sync_channel::<u32>(32);
+    let sink = Box::new(IndependentTrackJobSink { observed_tx });
+
+    let handle = Executor::new(&job, &ctx)
+        .with_threads(4)
+        .with_sink_override("@display", sink)
+        .spawn()
+        .expect("spawn dual-track packet source");
+
+    let observed_track = observed_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("second TrackSink made no progress while first TrackSink was blocked");
+    assert_eq!(observed_track, 1);
+
+    handle.request_abort();
+    let stats = handle
+        .stop()
+        .expect("cancelling a blocked TrackSink should stop cleanly");
+    assert!(
+        stats.frames_written >= 1,
+        "successful direct TrackSink delivery must count as frames_written"
+    );
 }
 
 #[test]
