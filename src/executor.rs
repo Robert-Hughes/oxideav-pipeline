@@ -457,10 +457,10 @@ impl<'a> Executor<'a> {
     /// match Executor::new(&job, &ctx).run_reporting() {
     ///     Ok(stats) => println!("done: {} packets", stats.packets_read),
     ///     Err(f) if f.stage == FailureStage::Prepare => {
-    ///         eprintln!("setup failed before any data flowed: {f}");
+    ///         log::warn!("setup failed before any data flowed: {f}");
     ///     }
     ///     Err(f) => {
-    ///         eprintln!(
+    ///         log::warn!(
     ///             "{} failed mid-stream after {} frames: {}",
     ///             f.output.as_deref().unwrap_or("job"),
     ///             f.stats.frames_written,
@@ -1723,9 +1723,11 @@ impl TrackRuntime {
                     // single recoverable bit-stream glitch should be
                     // logged and skipped, not propagated to the executor.
                     stats.packets_skipped += 1;
-                    eprintln!(
+                    log::warn!(
                         "executor: decoder skipped packet (track {}, pts {:?}): {}",
-                        track_index, pkt.pts, e
+                        track_index,
+                        pkt.pts,
+                        e
                     );
                     return Ok(());
                 }
@@ -1746,9 +1748,11 @@ impl TrackRuntime {
                         if !produced_any {
                             stats.packets_skipped += 1;
                         }
-                        eprintln!(
+                        log::warn!(
                             "executor: decoder receive_frame error (track {}, pts {:?}): {}",
-                            track_index, pkt.pts, e
+                            track_index,
+                            pkt.pts,
+                            e
                         );
                         break;
                     }
@@ -1844,9 +1848,10 @@ impl TrackRuntime {
         if self.decoder.is_some() {
             if let Some(dec) = &mut self.decoder {
                 if let Err(e) = dec.flush() {
-                    eprintln!(
+                    log::warn!(
                         "executor: decoder flush error (track {}): {}",
-                        track_index, e
+                        track_index,
+                        e
                     );
                 }
             }
@@ -1855,9 +1860,10 @@ impl TrackRuntime {
                     Ok(f) => f,
                     Err(Error::NeedMore) | Err(Error::Eof) => break,
                     Err(e) => {
-                        eprintln!(
+                        log::warn!(
                             "executor: decoder error during EOF drain (track {}): {}",
-                            track_index, e
+                            track_index,
+                            e
                         );
                         break;
                     }

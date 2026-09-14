@@ -14,6 +14,7 @@ keywords = ["multimedia", "pipeline", "transcoding", "streaming", "pure-rust"]
 categories = ["multimedia"]
 
 [dependencies]
+log = "0.4"
 # Codec / container / source / filter trait + registry types live in
 # oxideav-core directly now; the former oxideav-codec / oxideav-container
 # shim crates are being archived. oxideav-source still hosts the

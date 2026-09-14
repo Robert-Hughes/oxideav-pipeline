@@ -189,7 +189,7 @@ pub struct Progress {
     /// recoverable per-packet error — either `send_packet` returned an
     /// error (the packet never produced a frame) or the subsequent
     /// `receive_frame` errored before yielding any output. Each event
-    /// is logged via the existing `eprintln!` path; this counter lets an
+    /// is logged via the existing `log::warn!` path; this counter lets an
     /// engine surface the same information in its status bar without
     /// scraping stderr, and lets a stress harness assert on the
     /// tolerance contract pinned by `tests/decoder_error_tolerance.rs`.
@@ -465,7 +465,7 @@ struct PipelineCounters {
     /// Decoder-skip counter. Bumped by the decode stage on every
     /// packet whose `send_packet` errored, and on every packet whose
     /// downstream `receive_frame` errored before yielding a frame —
-    /// matching the two `eprintln!` branches in `run_decode_stage`.
+    /// matching the two `log::warn!` branches in `run_decode_stage`.
     /// Surfaced to the engine via [`Progress::packets_skipped`] and
     /// to the final stats via [`ExecutorStats::packets_skipped`].
     packets_skipped: AtomicU64,
@@ -1968,9 +1968,11 @@ fn run_decode_stage(
                         return Err(e);
                     }
                     counters.packets_skipped.fetch_add(1, Ordering::SeqCst);
-                    eprintln!(
+                    log::warn!(
                         "pipeline: decoder skipped packet (stream {}, pts {:?}): {}",
-                        pkt.stream_index, pkt.pts, e
+                        pkt.stream_index,
+                        pkt.pts,
+                        e
                     );
                     continue;
                 }
@@ -2010,7 +2012,7 @@ fn run_decode_stage(
                             if !produced_any {
                                 counters.packets_skipped.fetch_add(1, Ordering::SeqCst);
                             }
-                            eprintln!(
+                            log::warn!(
                                 "pipeline: decoder skipped frame after packet (stream {}, pts {:?}): {}",
                                 pkt.stream_index, pkt.pts, e
                             );
@@ -2030,7 +2032,7 @@ fn run_decode_stage(
             }
             Ok(Msg::Eof) => {
                 if let Err(e) = decoder.flush() {
-                    eprintln!("pipeline: decoder flush error: {}", e);
+                    log::warn!("pipeline: decoder flush error: {}", e);
                 }
                 loop {
                     if abort.is_aborted() {
@@ -2046,7 +2048,7 @@ fn run_decode_stage(
                         }
                         Err(Error::NeedMore) | Err(Error::Eof) => break,
                         Err(e) => {
-                            eprintln!("pipeline: decoder error during EOF drain: {}", e);
+                            log::warn!("pipeline: decoder error during EOF drain: {}", e);
                             break;
                         }
                     }
