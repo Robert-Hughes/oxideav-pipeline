@@ -30,7 +30,7 @@
 //! [`AbortState`]; the first error wins, other stages bail cleanly.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -783,10 +783,58 @@ fn deliver_frame_barrier(
 /// Both fields are independent — a caller can wire only one if needed.
 /// Used today by [`crate::Executor::spawn`]; the synchronous
 /// [`crate::Executor::run`] passes `None` and gets the legacy behaviour.
+#[derive(Clone)]
+struct PacketRouteSender {
+    tx: SyncSender<Msg<Packet>>,
+    depth: Arc<AtomicUsize>,
+}
+
+fn release_packet_depth(depth: &AtomicUsize) {
+    let _ = depth.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+        Some(value.saturating_sub(1))
+    });
+}
+
+#[derive(Clone)]
+struct PacketQueueAccounting {
+    budget: Arc<QueueBudget>,
+    depth: Arc<AtomicUsize>,
+}
+
+impl PacketQueueAccounting {
+    fn release(&self, packet: &Packet) {
+        release_packet_depth(&self.depth);
+        self.budget.release(packet.data.len() as u64);
+    }
+}
+
+impl PacketRouteSender {
+    fn send_data(&self, packet: Packet) -> std::result::Result<(), mpsc::SendError<Msg<Packet>>> {
+        self.depth.fetch_add(1, Ordering::SeqCst);
+        match self.tx.send(Msg::Data(packet)) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.depth.fetch_sub(1, Ordering::SeqCst);
+                Err(error)
+            }
+        }
+    }
+
+    fn send_control(
+        &self,
+        message: Msg<Packet>,
+    ) -> std::result::Result<(), mpsc::SendError<Msg<Packet>>> {
+        self.tx.send(message)
+    }
+}
+
 pub(crate) struct PipelineControl {
     pub seek_rx: Option<Receiver<SeekCmd>>,
     pub progress_tx: Option<SyncSender<Progress>>,
     pub abort: Option<Arc<AbortState>>,
+    /// Live per-track depth accounting for the demux/packet-source -> worker
+    /// packet channels. Entries are in routed-track order.
+    pub packet_queue_depths: Option<Vec<Arc<AtomicUsize>>>,
     /// Per-track channel-depth budget. `None` means use the
     /// [`ChannelCaps::default()`] (16 packets, 8 frames). Threaded
     /// through from [`crate::Executor::with_channel_caps`].
@@ -826,6 +874,7 @@ pub(crate) fn run_pipelined(
             seek_rx: None,
             progress_tx: None,
             abort: None,
+            packet_queue_depths: None,
             caps,
             max_queue_bytes,
             discard_on_failure,
@@ -931,6 +980,12 @@ pub(crate) fn run_pipelined_inner(
     let progress_tx = control.progress_tx;
     let mut seek_rx = control.seek_rx;
     let (pkt_cap, frame_cap) = control.caps.unwrap_or_default().resolved();
+    let packet_queue_depths = control.packet_queue_depths.unwrap_or_else(|| {
+        (0..pipelines.len())
+            .map(|_| Arc::new(AtomicUsize::new(0)))
+            .collect()
+    });
+    debug_assert_eq!(packet_queue_depths.len(), pipelines.len());
     // Shared byte ceiling on the demuxer→worker packet queues. `0`
     // (default) is a no-op: `admit` / `release` short-circuit and the
     // demuxer never parks, so the count caps alone govern.
@@ -975,7 +1030,8 @@ pub(crate) fn run_pipelined_inner(
     // out to, plus the list of frame_tx senders a frame-pump thread
     // fans decoded frames out to (frame-shape sources have exactly one
     // synthetic stream, so no per-stream index is needed).
-    type Route = (u32, SyncSender<Msg<Packet>>);
+
+    type Route = (u32, PacketRouteSender);
     let mut routes_by_uri: HashMap<String, Vec<Route>> = HashMap::new();
     let mut frame_routes_by_uri: HashMap<String, Vec<SyncSender<Msg<FrameLease>>>> = HashMap::new();
 
@@ -1027,10 +1083,14 @@ pub(crate) fn run_pipelined_inner(
             frame0_rx
         } else {
             let (pkt_tx, pkt_rx) = mpsc::sync_channel::<Msg<Packet>>(pkt_cap);
-            routes_by_uri
-                .entry(source_uri)
-                .or_default()
-                .push((source_stream, pkt_tx));
+            let packet_depth = packet_queue_depths[track_idx].clone();
+            routes_by_uri.entry(source_uri).or_default().push((
+                source_stream,
+                PacketRouteSender {
+                    tx: pkt_tx,
+                    depth: packet_depth.clone(),
+                },
+            ));
 
             if pl.copy {
                 let abort_c = abort.clone();
@@ -1044,7 +1104,18 @@ pub(crate) fn run_pipelined_inner(
                     name,
                     FailureStage::Copy,
                     stage_track,
-                    move |abort| run_copy_stage(pkt_rx, terminal, abort, counters_c, budget_c),
+                    move |abort| {
+                        run_copy_stage(
+                            pkt_rx,
+                            terminal,
+                            abort,
+                            counters_c,
+                            PacketQueueAccounting {
+                                budget: budget_c,
+                                depth: packet_depth,
+                            },
+                        )
+                    },
                 ));
                 continue;
             }
@@ -1093,7 +1164,10 @@ pub(crate) fn run_pipelined_inner(
                         stream_update,
                         abort,
                         counters_d,
-                        budget_d,
+                        PacketQueueAccounting {
+                            budget: budget_d,
+                            depth: packet_depth,
+                        },
                     )
                 },
             ));
@@ -1606,7 +1680,7 @@ where
 /// demuxer whose `seek_to` was the default `Error::unsupported`.
 fn run_demuxer_stage(
     mut dmx: Box<dyn Demuxer>,
-    routes: Vec<(u32, SyncSender<Msg<Packet>>)>,
+    routes: Vec<(u32, PacketRouteSender)>,
     abort: Arc<AbortState>,
     counters: Arc<PipelineCounters>,
     seek_rx: Option<Receiver<SeekCmd>>,
@@ -1676,7 +1750,7 @@ fn run_demuxer_stage(
                     },
                 };
                 for (_, tx) in &routes {
-                    if tx.send(Msg::Barrier(kind)).is_err() {
+                    if tx.send_control(Msg::Barrier(kind)).is_err() {
                         abort.request_abort();
                         return Ok(());
                     }
@@ -1698,7 +1772,7 @@ fn run_demuxer_stage(
                     // Each matched route gets its own `pkt.clone()`, hence
                     // its own admit/release pair.
                     budget.admit(bytes);
-                    if tx.send(Msg::Data(pkt.clone())).is_err() {
+                    if tx.send_data(pkt.clone()).is_err() {
                         // Consumer gone; likely aborted. The packet never
                         // reached a receiver, so the consumer will never
                         // release it — undo the admit here.
@@ -1713,7 +1787,7 @@ fn run_demuxer_stage(
         }
     }
     for (_, tx) in routes {
-        let _ = tx.send(Msg::Eof);
+        let _ = tx.send_control(Msg::Eof);
     }
     Ok(())
 }
@@ -1766,7 +1840,7 @@ fn resolve_seek_target<T>(
 
 fn run_packet_source_stage(
     mut src: Box<dyn PacketSource>,
-    routes: Vec<(u32, SyncSender<Msg<Packet>>)>,
+    routes: Vec<(u32, PacketRouteSender)>,
     abort: Arc<AbortState>,
     counters: Arc<PipelineCounters>,
     seek_rx: Option<Receiver<SeekCmd>>,
@@ -1802,7 +1876,7 @@ fn run_packet_source_stage(
                     },
                 };
                 for (_, tx) in &routes {
-                    if tx.send(Msg::Barrier(kind)).is_err() {
+                    if tx.send_control(Msg::Barrier(kind)).is_err() {
                         abort.request_abort();
                         return Ok(());
                     }
@@ -1818,7 +1892,7 @@ fn run_packet_source_stage(
                         continue;
                     }
                     budget.admit(bytes);
-                    if tx.send(Msg::Data(pkt.clone())).is_err() {
+                    if tx.send_data(pkt.clone()).is_err() {
                         budget.release(bytes);
                         abort.request_abort();
                         break;
@@ -1830,7 +1904,7 @@ fn run_packet_source_stage(
         }
     }
     for (_, tx) in routes {
-        let _ = tx.send(Msg::Eof);
+        let _ = tx.send_control(Msg::Eof);
     }
     Ok(())
 }
@@ -1905,7 +1979,7 @@ fn run_copy_stage(
     mut terminal: TrackTerminal,
     abort: Arc<AbortState>,
     counters: Arc<PipelineCounters>,
-    budget: Arc<QueueBudget>,
+    packet_queue: PacketQueueAccounting,
 ) -> Result<()> {
     loop {
         if abort.is_aborted() {
@@ -1913,7 +1987,7 @@ fn run_copy_stage(
         }
         match rx.recv() {
             Ok(Msg::Data(pkt)) => {
-                budget.release(pkt.data.len() as u64);
+                packet_queue.release(&pkt);
                 match terminal.write_packet(pkt) {
                     Ok(DeliveryStatus::Delivered) => {
                         counters.packets_copied.fetch_add(1, Ordering::SeqCst);
@@ -1950,7 +2024,7 @@ fn run_decode_stage(
     mut stream_template: Option<StreamInfo>,
     abort: Arc<AbortState>,
     counters: Arc<PipelineCounters>,
-    budget: Arc<QueueBudget>,
+    packet_queue: PacketQueueAccounting,
 ) -> Result<()> {
     let mut last_stream_params: Option<CodecParameters> = None;
     'outer: loop {
@@ -1959,7 +2033,7 @@ fn run_decode_stage(
         }
         match rx.recv() {
             Ok(Msg::Data(pkt)) => {
-                budget.release(pkt.data.len() as u64);
+                packet_queue.release(&pkt);
                 if let Err(e) = decoder.send_packet(&pkt) {
                     if e.is_cancelled() && abort.is_aborted() {
                         break 'outer;
@@ -2408,6 +2482,36 @@ mod tests {
     }
 
     #[test]
+    fn packet_route_depth_tracks_only_queued_data_and_rolls_back_failed_send() {
+        let depth = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = mpsc::sync_channel(2);
+        let route = PacketRouteSender {
+            tx,
+            depth: Arc::clone(&depth),
+        };
+
+        route
+            .send_control(Msg::Barrier(BarrierKind::SeekRejected { generation: 1 }))
+            .unwrap();
+        assert_eq!(depth.load(Ordering::SeqCst), 0);
+        assert!(matches!(rx.recv().unwrap(), Msg::Barrier(_)));
+
+        route
+            .send_data(Packet::new(0, TimeBase::new(1, 90_000), vec![1]))
+            .unwrap();
+        assert_eq!(depth.load(Ordering::SeqCst), 1);
+        assert!(matches!(rx.recv().unwrap(), Msg::Data(_)));
+        release_packet_depth(&depth);
+        assert_eq!(depth.load(Ordering::SeqCst), 0);
+
+        drop(rx);
+        assert!(route
+            .send_data(Packet::new(0, TimeBase::new(1, 90_000), vec![2]))
+            .is_err());
+        assert_eq!(depth.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn queue_budget_zero_is_disabled() {
         // `0` means "no byte ceiling": `enabled()` is false, admit/release
         // are no-ops, and the in-flight total never moves off zero. This
@@ -2546,7 +2650,10 @@ mod tests {
             Some(template),
             abort,
             counters,
-            budget,
+            PacketQueueAccounting {
+                budget,
+                depth: Arc::new(AtomicUsize::new(0)),
+            },
         )
         .unwrap();
 
@@ -2623,7 +2730,10 @@ mod tests {
                 None,
                 worker_abort,
                 counters,
-                budget,
+                PacketQueueAccounting {
+                    budget,
+                    depth: Arc::new(AtomicUsize::new(0)),
+                },
             );
             done_tx.send(result).expect("report worker result");
         });

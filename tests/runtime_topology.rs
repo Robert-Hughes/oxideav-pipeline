@@ -41,5 +41,11 @@ fn spawned_handle_reports_resolved_topology_and_caps() {
     assert!(track.copy);
     assert!(matches!(track.stages.as_slice(), [PipelineStageInfo::Copy]));
 
+    let depths = handle.pipeline_packet_queue_depths();
+    assert_eq!(depths.len(), topology.tracks.len());
+    assert!(depths
+        .iter()
+        .all(|depth| *depth <= topology.packet_channel_capacity));
+
     handle.stop().expect("stop executor");
 }

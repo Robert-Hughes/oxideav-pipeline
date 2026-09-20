@@ -2441,6 +2441,7 @@ pub struct ExecutorHandle {
     /// [`Self::stop_reporting`]'s failure attribution.
     output_name: String,
     pipeline_topology: PipelineTopology,
+    packet_queue_depths: Vec<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 impl ExecutorHandle {
@@ -2458,6 +2459,10 @@ impl ExecutorHandle {
         let output_name = prep.output_name.clone();
         let (packet_channel_capacity, frame_channel_capacity) =
             prep.channel_caps.unwrap_or_default().resolved();
+        let packet_queue_depths = (0..prep.pipelines.len())
+            .map(|_| std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)))
+            .collect::<Vec<_>>();
+        let packet_queue_depths_t = packet_queue_depths.clone();
         let pipeline_tracks = prep
             .pipelines
             .iter()
@@ -2488,6 +2493,7 @@ impl ExecutorHandle {
                         seek_rx: Some(seek_rx),
                         progress_tx: Some(progress_tx),
                         abort: Some(abort_t),
+                        packet_queue_depths: Some(packet_queue_depths_t),
                         caps,
                         max_queue_bytes,
                         discard_on_failure,
@@ -2506,6 +2512,7 @@ impl ExecutorHandle {
             finished,
             output_name,
             pipeline_topology,
+            packet_queue_depths,
         }
     }
 
@@ -2519,6 +2526,22 @@ impl ExecutorHandle {
     /// instantiation, before worker threads start.
     pub fn pipeline_topology(&self) -> &PipelineTopology {
         &self.pipeline_topology
+    }
+
+    /// Current depths of the real per-track compressed-packet channels.
+    ///
+    /// Entries correspond one-for-one with pipeline_tracks(). Frame-source
+    /// tracks have no compressed-packet channel and therefore report zero.
+    pub fn pipeline_packet_queue_depths(&self) -> Vec<usize> {
+        let capacity = self.pipeline_topology.packet_channel_capacity;
+        self.packet_queue_depths
+            .iter()
+            .map(|depth| {
+                depth
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    .min(capacity)
+            })
+            .collect()
     }
 
     /// Issue a seek to `(stream_idx, pts)` in `time_base` units. The
