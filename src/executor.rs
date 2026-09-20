@@ -21,17 +21,17 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use oxideav_core::{
-    CodecId, CodecParameters, CodecRegistry, Decoder, Demuxer, Encoder, Error, ExecutionContext,
-    FilterContext, FilterRegistry, Frame, FrameLease, FrameSource, MediaType, Packet, PacketSource,
-    PixelFormat, PortParams, PortSpec, Rational, ReadSeek, Result, RuntimeContext, SampleFormat,
-    SourceOutput, StreamFilter, StreamInfo, TimeBase,
+    CodecCapabilities, CodecId, CodecParameters, CodecRegistry, Decoder, Demuxer, Encoder, Error,
+    ExecutionContext, FilterContext, FilterRegistry, Frame, FrameLease, FrameSource, MediaType,
+    Packet, PacketSource, PixelFormat, PortParams, PortSpec, Rational, ReadSeek, Result,
+    RuntimeContext, SampleFormat, SourceOutput, StreamFilter, StreamInfo, TimeBase,
 };
 use oxideav_pixfmt::{convert as pixfmt_convert, ConvertOptions};
 
 use crate::dag::{codec_accepted_pixel_formats, Dag, DagNode, MuxTrack, ResolvedSelector};
 use crate::failure::{attribute, FailureStage, RunFailure, StageFailure, StageResult};
 use crate::schema::{is_reserved_sink, Job};
-use crate::selection::{make_decoder_with, make_encoder_with, CodecPreferences};
+use crate::selection::{make_decoder_with_selection, make_encoder_with, CodecPreferences};
 use crate::sinks::{open_file_write, FileSink, NullSink};
 use crate::staged;
 
@@ -1336,6 +1336,20 @@ pub(crate) enum StageSpec {
     },
 }
 
+/// Immutable runtime identity for one routed executor track.
+///
+/// Decoder capabilities are the registration that actually instantiated
+/// successfully after preference filtering and init-time fallback.
+#[derive(Clone, Debug)]
+pub struct PipelineTrackInfo {
+    pub source_uri: String,
+    pub source_stream: u32,
+    pub media_type: MediaType,
+    pub codec_id: CodecId,
+    pub copy: bool,
+    pub decoder: Option<CodecCapabilities>,
+}
+
 /// One track's execution state: decoder + per-frame stage chain +
 /// encoder, plus the resolved source URI + selected stream index. Used
 /// by both the serial executor and the pipelined runner in
@@ -1358,6 +1372,7 @@ pub(crate) struct TrackRuntime {
     /// `input_time_base` units. Preserved/rescaled for sink-facing metadata.
     pub(crate) input_duration: Option<i64>,
     pub(crate) decoder: Option<Box<dyn Decoder>>,
+    pub(crate) decoder_caps: Option<CodecCapabilities>,
     /// Per-frame stages in order (filters + pixel-format conversions)
     /// between the decoder and the encoder. The pipelined runner
     /// drains this vector to spawn one worker per stage.
@@ -1464,6 +1479,7 @@ impl TrackRuntime {
             input_start_time: None,
             input_duration: None,
             decoder: None,
+            decoder_caps: None,
             frame_stages: Vec::new(),
             encoder: None,
             encoder_time_base: None,
@@ -1492,6 +1508,17 @@ impl TrackRuntime {
         )
     }
 
+    fn pipeline_info(&self) -> PipelineTrackInfo {
+        PipelineTrackInfo {
+            source_uri: self.source_uri.clone(),
+            source_stream: self.source_stream,
+            media_type: self.kind,
+            codec_id: self.input_params.codec_id.clone(),
+            copy: self.copy,
+            decoder: self.decoder_caps.clone(),
+        }
+    }
+
     pub(crate) fn instantiate(
         &mut self,
         codecs: &CodecRegistry,
@@ -1511,9 +1538,11 @@ impl TrackRuntime {
             match stage {
                 StageSpec::Decode => {
                     if self.decoder.is_none() {
-                        let mut d = make_decoder_with(codecs, &self.input_params, preferences)?;
-                        d.set_execution_context(ctx);
-                        self.decoder = Some(d);
+                        let (mut decoder, caps) =
+                            make_decoder_with_selection(codecs, &self.input_params, preferences)?;
+                        decoder.set_execution_context(ctx);
+                        self.decoder = Some(decoder);
+                        self.decoder_caps = Some(caps);
                     }
                 }
                 StageSpec::Filter { name, params } => {
@@ -2343,6 +2372,7 @@ pub struct ExecutorHandle {
     /// Output key of the (single) spawned output, for
     /// [`Self::stop_reporting`]'s failure attribution.
     output_name: String,
+    pipeline_tracks: Vec<PipelineTrackInfo>,
 }
 
 impl ExecutorHandle {
@@ -2358,6 +2388,11 @@ impl ExecutorHandle {
         let max_queue_bytes = prep.max_queue_bytes;
         let discard_on_failure = prep.discard_on_failure;
         let output_name = prep.output_name.clone();
+        let pipeline_tracks = prep
+            .pipelines
+            .iter()
+            .map(TrackRuntime::pipeline_info)
+            .collect();
         let join = std::thread::Builder::new()
             .name("oxideav-pipeline-exec".into())
             .spawn(move || {
@@ -2387,7 +2422,14 @@ impl ExecutorHandle {
             join: Some(join),
             finished,
             output_name,
+            pipeline_tracks,
         }
+    }
+
+    /// Immutable runtime track identities captured after decoder
+    /// selection and before worker threads start.
+    pub fn pipeline_tracks(&self) -> &[PipelineTrackInfo] {
+        &self.pipeline_tracks
     }
 
     /// Issue a seek to `(stream_idx, pts)` in `time_base` units. The

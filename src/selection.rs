@@ -83,6 +83,19 @@ pub fn make_decoder_with(
     params: &CodecParameters,
     prefs: &CodecPreferences,
 ) -> Result<Box<dyn Decoder>> {
+    make_decoder_with_selection(reg, params, prefs).map(|(decoder, _)| decoder)
+}
+
+/// Same selection walk as [`make_decoder_with`], but also returns the
+/// capabilities record for the implementation whose factory actually
+/// succeeded. This is intended for runtime diagnostics: callers can report
+/// the real implementation after preference filtering and init-time fallback
+/// instead of inferring it from the requested policy.
+pub fn make_decoder_with_selection(
+    reg: &CodecRegistry,
+    params: &CodecParameters,
+    prefs: &CodecPreferences,
+) -> Result<(Box<dyn Decoder>, CodecCapabilities)> {
     let candidates = reg.implementations(&params.codec_id);
     if candidates.is_empty() {
         return Err(Error::CodecNotFound(params.codec_id.to_string()));
@@ -96,8 +109,8 @@ pub fn make_decoder_with(
     let mut last_err: Option<Error> = None;
     for imp in ranked {
         match (imp.make_decoder.unwrap())(params) {
-            Ok(d) => return Ok(d),
-            Err(e) => last_err = Some(e),
+            Ok(decoder) => return Ok((decoder, imp.caps.clone())),
+            Err(error) => last_err = Some(error),
         }
     }
     Err(last_err.unwrap_or_else(|| {
@@ -182,5 +195,68 @@ mod tests {
         };
         assert!(prefs.excludes(&caps("aac_audiotoolbox", true)));
         assert!(prefs.excludes(&caps("aac_sw", false)));
+    }
+
+    struct SelectedDecoder {
+        codec_id: oxideav_core::CodecId,
+    }
+
+    impl Decoder for SelectedDecoder {
+        fn codec_id(&self) -> &oxideav_core::CodecId {
+            &self.codec_id
+        }
+
+        fn send_packet(&mut self, _packet: &oxideav_core::Packet) -> Result<()> {
+            Ok(())
+        }
+
+        fn receive_frame(&mut self) -> Result<oxideav_core::Frame> {
+            Err(Error::NeedMore)
+        }
+
+        fn flush(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn failing_decoder(_params: &CodecParameters) -> Result<Box<dyn Decoder>> {
+        Err(Error::unsupported("preferred implementation unavailable"))
+    }
+
+    fn fallback_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
+        Ok(Box::new(SelectedDecoder {
+            codec_id: params.codec_id.clone(),
+        }))
+    }
+
+    #[test]
+    fn selected_decoder_metadata_tracks_factory_that_actually_succeeds() {
+        let codec_id = oxideav_core::CodecId::new("selection_metadata_test");
+        let mut reg = CodecRegistry::new();
+        reg.register(
+            oxideav_core::CodecInfo::new(codec_id.clone())
+                .capabilities(
+                    CodecCapabilities::video("preferred_hw")
+                        .with_hardware(true)
+                        .with_priority(10),
+                )
+                .decoder(failing_decoder),
+        );
+        reg.register(
+            oxideav_core::CodecInfo::new(codec_id.clone())
+                .capabilities(
+                    CodecCapabilities::video("fallback_sw")
+                        .with_hardware(false)
+                        .with_priority(100),
+                )
+                .decoder(fallback_decoder),
+        );
+
+        let params = CodecParameters::video(codec_id);
+        let (_decoder, selected) =
+            make_decoder_with_selection(&reg, &params, &CodecPreferences::default()).unwrap();
+
+        assert_eq!(selected.implementation, "fallback_sw");
+        assert!(!selected.hardware_accelerated);
     }
 }

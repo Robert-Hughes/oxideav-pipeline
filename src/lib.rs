@@ -23,7 +23,8 @@ pub mod validate;
 
 pub use dag::{Dag, DagNode, NodeId};
 pub use executor::{
-    Executor, ExecutorHandle, JobSink, RenderSourceFactory, TrackSink, TrackSinkInfo,
+    Executor, ExecutorHandle, JobSink, PipelineTrackInfo, RenderSourceFactory, TrackSink,
+    TrackSinkInfo,
 };
 pub use failure::{FailureStage, RunFailure};
 pub use oxideav_core::{FilterFactory, FilterRegistry};
@@ -32,7 +33,8 @@ pub use schema::{
     StreamSelector, TrackInput, TrackSpec,
 };
 pub use selection::{
-    make_decoder, make_decoder_with, make_encoder, make_encoder_with, CodecPreferences,
+    make_decoder, make_decoder_with, make_decoder_with_selection, make_encoder, make_encoder_with,
+    CodecPreferences,
 };
 pub use sinks::{FileSink, NullSink};
 pub use staged::{BarrierKind, ChannelCaps, Progress, SeekCmd};
