@@ -44,7 +44,7 @@ use oxideav_core::{
 use oxideav_core::{Decoder, Encoder};
 
 use crate::executor::{
-    flush_frame_stage_emit, frame_stage_failure_kind, run_frame_stage_emit, ExecutorStats,
+    flush_frame_stage_emit, frame_stage_failure_kind, run_frame_stage_emit, EofMode, ExecutorStats,
     FrameStage, JobSink, SourcePump, TrackRuntime, TrackSink, TrackSinkInfo,
 };
 use crate::failure::{attribute, FailureStage, StageFailure, StageResult};
@@ -442,14 +442,15 @@ impl QueueBudget {
 /// * `Data` — payload (packet/frame).
 /// * `StreamUpdate` — authoritative decoded stream metadata discovered after
 ///   `JobSink::start()`; ordered before frames that use the new format.
-/// * `Barrier` — flow-control marker. Today only `SeekFlush` is in use;
-///   workers reset codec/filter state and forward unchanged.
-/// * `Eof` — in-band end-of-stream so downstream stages can flush state
-///   before exiting.
+/// * `Barrier` — flow-control marker. Today only seek barriers are public.
+/// * `EpochEnd` — retained-EOF marker: drain buffered state, notify the sink,
+///   then keep waiting for a later `SeekFlush`.
+/// * `Eof` — terminal end-of-stream so downstream stages flush and exit.
 enum Msg<T> {
     Data(T),
     StreamUpdate(Box<StreamInfo>),
     Barrier(BarrierKind),
+    EpochEnd,
     Eof,
 }
 
@@ -665,6 +666,21 @@ impl TrackTerminal {
         }
     }
 
+    fn epoch_end(&mut self) -> Result<DeliveryStatus> {
+        let abort = self.abort.clone();
+        let track_index = self.track_index;
+        match &mut self.target {
+            TrackTerminalTarget::Aggregate(tx) => match tx.send(Msg::EpochEnd) {
+                Ok(()) => Ok(DeliveryStatus::Delivered),
+                Err(_) => Ok(DeliveryStatus::Closed),
+            },
+            TrackTerminalTarget::Independent(sink) => Self::record_sink_result(
+                &abort,
+                track_index,
+                sink.end_of_stream(track_index, self.kind),
+            ),
+        }
+    }
     fn eof(&mut self) {
         if let TrackTerminalTarget::Aggregate(tx) = &self.target {
             let _ = tx.send(Msg::Eof);
@@ -711,6 +727,15 @@ impl FrameDownstream {
         }
     }
 
+    fn epoch_end(&mut self) -> Result<DeliveryStatus> {
+        match self {
+            FrameDownstream::Channel(tx) => match tx.send(Msg::EpochEnd) {
+                Ok(()) => Ok(DeliveryStatus::Delivered),
+                Err(_) => Ok(DeliveryStatus::Closed),
+            },
+            FrameDownstream::Terminal(terminal) => terminal.epoch_end(),
+        }
+    }
     fn eof(&mut self) {
         match self {
             FrameDownstream::Channel(tx) => {
@@ -766,6 +791,18 @@ fn deliver_frame_barrier(
     abort: &Arc<AbortState>,
 ) -> Result<bool> {
     match downstream.barrier(barrier) {
+        Ok(DeliveryStatus::Delivered) => Ok(true),
+        Ok(DeliveryStatus::Closed) => {
+            abort.request_abort();
+            Ok(false)
+        }
+        Err(e) if e.is_cancelled() && abort.is_aborted() => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+fn deliver_epoch_end(downstream: &mut FrameDownstream, abort: &Arc<AbortState>) -> Result<bool> {
+    match downstream.epoch_end() {
         Ok(DeliveryStatus::Delivered) => Ok(true),
         Ok(DeliveryStatus::Closed) => {
             abort.request_abort();
@@ -851,6 +888,7 @@ pub(crate) struct PipelineControl {
     /// returns; a clean stop (abort without a recorded error) still
     /// finalises via `finish`.
     pub discard_on_failure: bool,
+    pub eof_mode: EofMode,
 }
 
 /// Run one output's pipeline. The caller has already instantiated all
@@ -878,6 +916,7 @@ pub(crate) fn run_pipelined(
             caps,
             max_queue_bytes,
             discard_on_failure,
+            eof_mode: EofMode::Finish,
         },
     )
 }
@@ -903,6 +942,7 @@ pub(crate) fn run_pipelined_inner(
     control: PipelineControl,
 ) -> StageResult<ExecutorStats> {
     let discard_on_failure = control.discard_on_failure;
+    let eof_mode = control.eof_mode;
     // Failed-output disposal (opt-in): on any failure path the sink
     // gets `abandon()` (drop partial artifacts) instead of `finish()`.
     // Bundled in a closure so every early-return site below stays a
@@ -1361,6 +1401,7 @@ pub(crate) fn run_pipelined_inner(
                             src_seek_rx,
                             seek_fanout,
                             budget_d,
+                            eof_mode,
                         )
                     },
                 ));
@@ -1381,6 +1422,7 @@ pub(crate) fn run_pipelined_inner(
                             src_seek_rx,
                             seek_fanout,
                             budget_d,
+                            eof_mode,
                         )
                     },
                 ));
@@ -1513,6 +1555,18 @@ pub(crate) fn run_pipelined_inner(
                     Ok(Msg::Barrier(kind)) => {
                         made_progress = true;
                         if let Err(e) = sink.barrier(kind) {
+                            abort.record_failure(StageFailure::new(
+                                FailureStage::Sink,
+                                Some(i as u32),
+                                e,
+                            ));
+                            break;
+                        }
+                    }
+                    Ok(Msg::EpochEnd) => {
+                        made_progress = true;
+                        let kind = out_streams[i].params.media_type;
+                        if let Err(e) = sink.end_of_stream(i as u32, kind) {
                             abort.record_failure(StageFailure::new(
                                 FailureStage::Sink,
                                 Some(i as u32),
@@ -1659,6 +1713,65 @@ where
         .expect("pipeline: thread spawn")
 }
 
+fn park_at_eof_until_seek<F>(
+    routes: &[(u32, PacketRouteSender)],
+    streams: &[StreamInfo],
+    abort: &Arc<AbortState>,
+    seek_rx: &Option<Receiver<SeekCmd>>,
+    seek_fanout: &[mpsc::Sender<SeekCmd>],
+    mut seek: F,
+) -> Result<bool>
+where
+    F: FnMut(u32, i64) -> Result<i64>,
+{
+    for (_, tx) in routes {
+        if tx.send_control(Msg::EpochEnd).is_err() {
+            abort.request_abort();
+            return Ok(false);
+        }
+    }
+
+    let Some(rx) = seek_rx.as_ref() else {
+        return Err(Error::unsupported(
+            "pipeline: WaitForSeek requires a live seek control channel",
+        ));
+    };
+    loop {
+        if abort.is_aborted() {
+            return Ok(false);
+        }
+        let cmd = match rx.recv_timeout(Duration::from_millis(20)) {
+            Ok(cmd) => cmd,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(false),
+        };
+        for tx in seek_fanout {
+            let _ = tx.send(cmd);
+        }
+        let (dst_stream, dst_pts, dst_tb) = resolve_seek_target(routes, streams, &cmd);
+        let kind = match seek(dst_stream, dst_pts) {
+            Ok(landed_pts) => BarrierKind::SeekFlush {
+                generation: cmd.generation,
+                landed_pts,
+                time_base: dst_tb,
+            },
+            Err(_) => BarrierKind::SeekRejected {
+                generation: cmd.generation,
+            },
+        };
+        let resumed = matches!(kind, BarrierKind::SeekFlush { .. });
+        for (_, tx) in routes {
+            if tx.send_control(Msg::Barrier(kind)).is_err() {
+                abort.request_abort();
+                return Ok(false);
+            }
+        }
+        if resumed {
+            return Ok(true);
+        }
+    }
+}
+
 // ───────────────────────── stage workers ─────────────────────────
 
 /// Demuxer thread: read packets until EOF, fan out to each route whose
@@ -1686,6 +1799,7 @@ fn run_demuxer_stage(
     seek_rx: Option<Receiver<SeekCmd>>,
     seek_fanout: Vec<mpsc::Sender<SeekCmd>>,
     budget: Arc<QueueBudget>,
+    eof_mode: EofMode,
 ) -> Result<()> {
     loop {
         if abort.is_aborted() {
@@ -1782,6 +1896,19 @@ fn run_demuxer_stage(
                     }
                 }
             }
+            Err(Error::Eof) if eof_mode == EofMode::WaitForSeek => {
+                let streams = dmx.streams().to_vec();
+                if !park_at_eof_until_seek(
+                    &routes,
+                    &streams,
+                    &abort,
+                    &seek_rx,
+                    &seek_fanout,
+                    |stream, pts| dmx.seek_to(stream, pts),
+                )? {
+                    break;
+                }
+            }
             Err(Error::Eof) => break,
             Err(e) => return Err(e),
         }
@@ -1846,6 +1973,7 @@ fn run_packet_source_stage(
     seek_rx: Option<Receiver<SeekCmd>>,
     seek_fanout: Vec<mpsc::Sender<SeekCmd>>,
     budget: Arc<QueueBudget>,
+    eof_mode: EofMode,
 ) -> Result<()> {
     loop {
         if abort.is_aborted() {
@@ -1897,6 +2025,19 @@ fn run_packet_source_stage(
                         abort.request_abort();
                         break;
                     }
+                }
+            }
+            Err(Error::Eof) if eof_mode == EofMode::WaitForSeek => {
+                let streams = src.streams().to_vec();
+                if !park_at_eof_until_seek(
+                    &routes,
+                    &streams,
+                    &abort,
+                    &seek_rx,
+                    &seek_fanout,
+                    |stream, pts| src.seek_to(stream, pts),
+                )? {
+                    break;
                 }
             }
             Err(Error::Eof) => break,
@@ -2010,6 +2151,15 @@ fn run_copy_stage(
                 Err(e) if e.is_cancelled() && abort.is_aborted() => break,
                 Err(e) => return Err(e),
             },
+            Ok(Msg::EpochEnd) => match terminal.epoch_end() {
+                Ok(DeliveryStatus::Delivered) => {}
+                Ok(DeliveryStatus::Closed) => {
+                    abort.request_abort();
+                    break;
+                }
+                Err(e) if e.is_cancelled() && abort.is_aborted() => break,
+                Err(e) => return Err(e),
+            },
             Ok(Msg::Eof) | Err(_) => break,
         }
     }
@@ -2098,9 +2248,36 @@ fn run_decode_stage(
             Ok(Msg::StreamUpdate(_)) => {}
             Ok(Msg::Barrier(b)) => {
                 if matches!(b, BarrierKind::SeekFlush { .. }) {
-                    let _ = decoder.reset();
+                    decoder.reset()?;
                 }
                 if !deliver_frame_barrier(&mut downstream, b, &abort)? {
+                    break;
+                }
+            }
+            Ok(Msg::EpochEnd) => {
+                if let Err(e) = decoder.flush() {
+                    log::warn!("pipeline: decoder flush error: {}", e);
+                }
+                loop {
+                    if abort.is_aborted() {
+                        break 'outer;
+                    }
+                    match decoder.receive_frame_lease() {
+                        Ok(frame) => {
+                            counters.frames_decoded.fetch_add(1, Ordering::SeqCst);
+                            if !deliver_frame_downstream(&mut downstream, frame, &abort, &counters)?
+                            {
+                                break 'outer;
+                            }
+                        }
+                        Err(Error::NeedMore) | Err(Error::Eof) => break,
+                        Err(e) => {
+                            log::warn!("pipeline: decoder error during EOF drain: {}", e);
+                            break;
+                        }
+                    }
+                }
+                if !deliver_epoch_end(&mut downstream, &abort)? {
                     break;
                 }
             }
@@ -2177,6 +2354,26 @@ fn run_frame_stage_worker(
                     let _ = etx.send(Msg::Barrier(b));
                 }
                 if !deliver_frame_barrier(&mut downstream, b, &abort)? {
+                    break;
+                }
+            }
+            Ok(Msg::EpochEnd) => {
+                let emissions = flush_frame_stage_emit(&mut stage)?;
+                dispatch_extras(emissions.extras, &extras_tx, extras_base, &abort);
+                for frame in emissions.primary {
+                    if !deliver_frame_downstream(
+                        &mut downstream,
+                        FrameLease::from_frame(frame),
+                        &abort,
+                        &counters,
+                    )? {
+                        break;
+                    }
+                }
+                if let Some(etx) = &extras_tx {
+                    let _ = etx.send(Msg::EpochEnd);
+                }
+                if !deliver_epoch_end(&mut downstream, &abort)? {
                     break;
                 }
             }
@@ -2283,6 +2480,11 @@ fn run_encode_stage(
                     Err(e) => return Err(e),
                 }
             }
+            Ok(Msg::EpochEnd) => {
+                return Err(Error::unsupported(
+                    "pipeline: retained EOF reached an encoder; WaitForSeek should have been rejected during preparation",
+                ));
+            }
             Ok(Msg::Eof) => {
                 encoder.flush()?;
                 let _ = drain_and_send(encoder.as_mut(), &mut terminal, &abort, &counters)?;
@@ -2320,6 +2522,11 @@ fn run_frame_fanout(
             }
             Ok(Msg::Barrier(b)) => {
                 if !deliver_frame_barrier(&mut downstream, b, &abort)? {
+                    break;
+                }
+            }
+            Ok(Msg::EpochEnd) => {
+                if !deliver_epoch_end(&mut downstream, &abort)? {
                     break;
                 }
             }

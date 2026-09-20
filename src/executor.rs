@@ -95,6 +95,14 @@ impl SourcePump {
             Self::Frames { .. } => PipelineSourceShape::FrameSource,
         }
     }
+
+    fn supports_seek(&self) -> bool {
+        match self {
+            Self::Demuxer(d) => d.supports_seek(),
+            Self::Packets(p) => p.supports_seek(),
+            Self::Frames { .. } => false,
+        }
+    }
 }
 
 /// Build a one-element `StreamInfo` list for a [`FrameSource`]. The
@@ -158,6 +166,12 @@ pub trait TrackSink: Send {
     fn barrier(&mut self, _barrier: crate::BarrierKind) -> Result<()> {
         Ok(())
     }
+
+    /// The current source epoch reached EOF but the executor is being retained
+    /// for a later seek. Unlike final `finish`, the sink must remain reusable.
+    fn end_of_stream(&mut self, _stream_index: u32, _kind: MediaType) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// A user-installable output sink. Implementations receive either raw
@@ -216,6 +230,11 @@ pub trait JobSink {
         Ok(())
     }
 
+    /// Notify an aggregate sink that one track reached retained EOF. The sink
+    /// remains open because a later seek may resume the same executor graph.
+    fn end_of_stream(&mut self, _stream_index: u32, _kind: MediaType) -> Result<()> {
+        Ok(())
+    }
     /// Drain any remaining internal state and finalise the whole output.
     fn finish(&mut self) -> Result<()>;
 
@@ -233,6 +252,15 @@ pub trait JobSink {
     }
 }
 
+/// Controls what the spawned executor does when every routed source reaches EOF.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EofMode {
+    /// Historical behaviour: propagate EOF, finish the sink, and tear the graph down.
+    #[default]
+    Finish,
+    /// Drain the current epoch, keep the graph alive, and park the source until a seek or abort.
+    WaitForSeek,
+}
 /// Job runner. Constructed with a validated `Job` and a unified
 /// [`RuntimeContext`] that bundles every registry the framework needs
 /// (codec / container / source / filter); dispatches to serial or
@@ -261,6 +289,8 @@ pub struct Executor<'a> {
     /// behaviour keeps whatever landed before the failure. Set via
     /// [`Self::with_discard_failed_outputs`].
     discard_failed_outputs: bool,
+    /// EOF handling policy for spawned, seek-controlled playback graphs.
+    eof_mode: EofMode,
     /// Optional factory for [`DagNode::Render3D`] nodes. When `None`,
     /// any `Render3D` node in the DAG fails source-shape resolution
     /// with an `Unsupported` error pointing at where to install the
@@ -290,6 +320,7 @@ impl<'a> Executor<'a> {
             channel_caps: None,
             max_queue_bytes: 0,
             discard_failed_outputs: false,
+            eof_mode: EofMode::Finish,
             render_source_factory: None,
             codec_preferences: CodecPreferences::default(),
         }
@@ -305,6 +336,14 @@ impl<'a> Executor<'a> {
     /// `Send`-able indirection.
     pub fn with_sink_override(mut self, name: &str, sink: Box<dyn JobSink + Send>) -> Self {
         self.sink_overrides.insert(name.to_string(), sink);
+        self
+    }
+
+    /// Configure end-of-stream handling for spawned playback graphs.
+    /// `WaitForSeek` keeps a seekable graph alive after draining EOF so a later
+    /// seek can resume without rebuilding the executor. The default is `Finish`.
+    pub fn with_eof_mode(mut self, mode: EofMode) -> Self {
+        self.eof_mode = mode;
         self
     }
 
@@ -482,6 +521,11 @@ impl<'a> Executor<'a> {
     /// ```
     pub fn run_reporting(mut self) -> std::result::Result<ExecutorStats, RunFailure> {
         self.job.validate().map_err(RunFailure::job_level)?;
+        if self.eof_mode == EofMode::WaitForSeek {
+            return Err(RunFailure::job_level(Error::unsupported(
+                "pipeline: WaitForSeek requires Executor::spawn() so a seek handle remains available",
+            )));
+        }
         let dag = self.job.to_dag().map_err(RunFailure::job_level)?;
         let threads = self.resolve_threads();
         let names: Vec<String> = dag.roots.keys().cloned().collect();
@@ -1253,6 +1297,29 @@ impl<'a> Executor<'a> {
         for pl in &mut pipelines {
             pl.apply_pixel_format_auto_insert(&self.ctx.codecs);
         }
+        if self.eof_mode == EofMode::WaitForSeek {
+            if pipelines.iter().any(|pipeline| {
+                pipeline
+                    .stages
+                    .iter()
+                    .any(|stage| matches!(stage, StageSpec::Encode { .. }))
+            }) {
+                return Err(Error::unsupported(
+                    "pipeline: WaitForSeek is not supported for graphs containing encoders",
+                ));
+            }
+            for pipeline in &pipelines {
+                let source = sources_by_uri.get(&pipeline.source_uri).ok_or_else(|| {
+                    Error::invalid("pipeline: WaitForSeek validation lost a routed source")
+                })?;
+                if !source.supports_seek() {
+                    return Err(Error::unsupported(format!(
+                        "pipeline: WaitForSeek requires every routed source to support seeking; {:?} does not",
+                        pipeline.source_uri
+                    )));
+                }
+            }
+        }
         let ctx = ExecutionContext::with_threads(threads);
         for pl in &mut pipelines {
             pl.instantiate(
@@ -1280,6 +1347,7 @@ impl<'a> Executor<'a> {
             channel_caps: self.channel_caps,
             max_queue_bytes: self.max_queue_bytes,
             discard_on_failure: self.discard_failed_outputs,
+            eof_mode: self.eof_mode,
         })
     }
 
@@ -2415,6 +2483,7 @@ pub(crate) struct PreparedRun {
     /// pipelined runner calls [`JobSink::abandon`] on the sink instead
     /// of dropping it silently.
     pub(crate) discard_on_failure: bool,
+    pub(crate) eof_mode: EofMode,
 }
 
 /// Live handle to a background-running [`Executor`]. Returned by
@@ -2456,6 +2525,7 @@ impl ExecutorHandle {
         let caps = prep.channel_caps;
         let max_queue_bytes = prep.max_queue_bytes;
         let discard_on_failure = prep.discard_on_failure;
+        let eof_mode = prep.eof_mode;
         let output_name = prep.output_name.clone();
         let (packet_channel_capacity, frame_channel_capacity) =
             prep.channel_caps.unwrap_or_default().resolved();
@@ -2497,6 +2567,7 @@ impl ExecutorHandle {
                         caps,
                         max_queue_bytes,
                         discard_on_failure,
+                        eof_mode,
                     },
                 );
                 finished_t.store(true, std::sync::atomic::Ordering::SeqCst);

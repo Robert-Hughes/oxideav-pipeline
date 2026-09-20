@@ -23,8 +23,8 @@ pub mod validate;
 
 pub use dag::{Dag, DagNode, NodeId};
 pub use executor::{
-    Executor, ExecutorHandle, JobSink, PipelineSourceShape, PipelineStageInfo, PipelineTopology,
-    PipelineTrackInfo, RenderSourceFactory, TrackSink, TrackSinkInfo,
+    EofMode, Executor, ExecutorHandle, JobSink, PipelineSourceShape, PipelineStageInfo,
+    PipelineTopology, PipelineTrackInfo, RenderSourceFactory, TrackSink, TrackSinkInfo,
 };
 pub use failure::{FailureStage, RunFailure};
 pub use oxideav_core::{FilterFactory, FilterRegistry};

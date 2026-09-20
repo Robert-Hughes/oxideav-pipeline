@@ -10,7 +10,7 @@ use oxideav_core::{
     DecoderFactory, Error, Frame, MediaType, Packet, PacketSource, Result, RuntimeContext,
     SampleFormat, StreamInfo, TimeBase,
 };
-use oxideav_pipeline::{BarrierKind, Executor, Job, JobSink};
+use oxideav_pipeline::{BarrierKind, EofMode, Executor, Job, JobSink};
 
 const CODEC: &str = "packet_seek_pcm";
 const RATE: i64 = 1_000;
@@ -70,10 +70,30 @@ impl PacketSource for SeekablePackets {
         self.next = clamped / PACKET_SAMPLES;
         Ok(self.next * PACKET_SAMPLES)
     }
+
+    fn supports_seek(&self) -> bool {
+        true
+    }
 }
 
 fn open_packets(_uri: &str) -> Result<Box<dyn PacketSource>> {
     Ok(Box::new(SeekablePackets::new()))
+}
+
+struct NonSeekPackets(SeekablePackets);
+
+impl PacketSource for NonSeekPackets {
+    fn streams(&self) -> &[StreamInfo] {
+        self.0.streams()
+    }
+
+    fn next_packet(&mut self) -> Result<Packet> {
+        self.0.next_packet()
+    }
+}
+
+fn open_nonseek_packets(_uri: &str) -> Result<Box<dyn PacketSource>> {
+    Ok(Box::new(NonSeekPackets(SeekablePackets::new())))
 }
 
 struct PassDecoder {
@@ -116,6 +136,8 @@ fn make_decoder(_params: &CodecParameters) -> Result<Box<dyn Decoder>> {
 
 fn register(ctx: &mut RuntimeContext) {
     ctx.sources.register_packets("seekpack", open_packets);
+    ctx.sources
+        .register_packets("noseekpack", open_nonseek_packets);
     ctx.codecs.register(
         CodecInfo::new(CodecId::new(CODEC))
             .capabilities(CodecCapabilities::audio(CODEC).with_decode())
@@ -127,6 +149,7 @@ enum Event {
     Started(Vec<StreamInfo>),
     Frame(Option<i64>),
     Barrier(BarrierKind),
+    EndOfStream(MediaType),
     Finished,
 }
 
@@ -152,6 +175,10 @@ impl JobSink for Sink {
     }
     fn barrier(&mut self, barrier: BarrierKind) -> Result<()> {
         self.tx.send(Event::Barrier(barrier)).unwrap();
+        Ok(())
+    }
+    fn end_of_stream(&mut self, _stream_index: u32, kind: MediaType) -> Result<()> {
+        self.tx.send(Event::EndOfStream(kind)).unwrap();
         Ok(())
     }
     fn finish(&mut self) -> Result<()> {
@@ -241,4 +268,129 @@ fn seekable_packet_source_emits_flush_and_continues_at_landing() {
     );
     handle.stop().unwrap();
     let _ = drainer.join();
+}
+
+#[test]
+fn wait_for_seek_parks_at_eof_and_resumes_without_rebuilding() {
+    let mut ctx = RuntimeContext::new();
+    register(&mut ctx);
+    let job = Job::from_json(
+        r#"{
+            "@in": {"all": [{"from": "seekpack://fixture"}]},
+            "@display": {"audio": [{"from": "@in"}]}
+        }"#,
+    )
+    .unwrap();
+    let (tx, rx) = mpsc::sync_channel(8);
+    let handle = Executor::new(&job, &ctx)
+        .with_sink_override("@display", Box::new(Sink { tx }))
+        .with_eof_mode(EofMode::WaitForSeek)
+        .with_threads(2)
+        .spawn()
+        .unwrap();
+
+    let Event::Started(streams) = wait_for(&rx, Instant::now() + Duration::from_secs(2), |event| {
+        matches!(event, Event::Started(_))
+    }) else {
+        unreachable!();
+    };
+    let stream = streams[0].clone();
+
+    let Event::EndOfStream(MediaType::Audio) =
+        wait_for(&rx, Instant::now() + Duration::from_secs(2), |event| {
+            matches!(event, Event::EndOfStream(MediaType::Audio))
+        })
+    else {
+        panic!("expected retained end-of-stream")
+    };
+    assert!(
+        !handle.has_finished(),
+        "WaitForSeek executor must remain alive at EOF"
+    );
+
+    let target = 10 * RATE;
+    let generation = handle
+        .seek_with_generation(stream.index, target, stream.time_base)
+        .unwrap();
+    let Event::Barrier(BarrierKind::SeekFlush {
+        generation: got_generation,
+        landed_pts,
+        ..
+    }) = wait_for(&rx, Instant::now() + Duration::from_secs(2), |event| {
+        matches!(event, Event::Barrier(_))
+    })
+    else {
+        panic!("expected SeekFlush after retained EOF")
+    };
+    assert_eq!(got_generation, generation);
+    assert_eq!(landed_pts, target);
+
+    let Event::Frame(Some(pts)) = wait_for(
+        &rx,
+        Instant::now() + Duration::from_secs(2),
+        |event| matches!(event, Event::Frame(Some(pts)) if *pts >= target),
+    ) else {
+        panic!("expected frame after seek from retained EOF")
+    };
+    assert!(pts >= target);
+    assert!(
+        !handle.has_finished(),
+        "executor must still be live after resumed seek"
+    );
+
+    let drainer = std::thread::spawn(
+        move || {
+            while rx.recv_timeout(Duration::from_millis(500)).is_ok() {}
+        },
+    );
+    handle.stop().unwrap();
+    let _ = drainer.join();
+}
+
+#[test]
+fn wait_for_seek_rejects_non_seekable_source_during_spawn() {
+    let mut ctx = RuntimeContext::new();
+    register(&mut ctx);
+    let job = Job::from_json(
+        r#"{
+            "@in": {"all": [{"from": "noseekpack://fixture"}]},
+            "@display": {"audio": [{"from": "@in"}]}
+        }"#,
+    )
+    .unwrap();
+    let (tx, _rx) = mpsc::sync_channel(8);
+    let result = Executor::new(&job, &ctx)
+        .with_sink_override("@display", Box::new(Sink { tx }))
+        .with_eof_mode(EofMode::WaitForSeek)
+        .with_threads(2)
+        .spawn();
+    let Err(error) = result else {
+        panic!("WaitForSeek unexpectedly accepted a non-seekable source")
+    };
+    assert!(error
+        .to_string()
+        .contains("requires every routed source to support seeking"));
+}
+
+#[test]
+fn wait_for_seek_rejects_encoder_graph_before_codec_instantiation() {
+    let mut ctx = RuntimeContext::new();
+    register(&mut ctx);
+    let job = Job::from_json(
+        r#"{
+            "@in": {"all": [{"from": "seekpack://fixture"}]},
+            "@display": {"audio": [{"from": "@in", "codec": "not_registered_on_purpose"}]}
+        }"#,
+    )
+    .unwrap();
+    let (tx, _rx) = mpsc::sync_channel(8);
+    let result = Executor::new(&job, &ctx)
+        .with_sink_override("@display", Box::new(Sink { tx }))
+        .with_eof_mode(EofMode::WaitForSeek)
+        .with_threads(2)
+        .spawn();
+    let Err(error) = result else {
+        panic!("WaitForSeek unexpectedly accepted an encoder graph")
+    };
+    assert!(error.to_string().contains("graphs containing encoders"));
 }
