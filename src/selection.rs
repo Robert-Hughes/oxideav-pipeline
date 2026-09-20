@@ -133,6 +133,17 @@ pub fn make_encoder_with(
     params: &CodecParameters,
     prefs: &CodecPreferences,
 ) -> Result<Box<dyn Encoder>> {
+    make_encoder_with_selection(reg, params, prefs).map(|(encoder, _)| encoder)
+}
+
+/// Same selection walk as [`make_encoder_with`], but also returns the
+/// capabilities record for the implementation whose factory actually
+/// succeeded.
+pub fn make_encoder_with_selection(
+    reg: &CodecRegistry,
+    params: &CodecParameters,
+    prefs: &CodecPreferences,
+) -> Result<(Box<dyn Encoder>, CodecCapabilities)> {
     let candidates = reg.implementations(&params.codec_id);
     if candidates.is_empty() {
         return Err(Error::CodecNotFound(params.codec_id.to_string()));
@@ -146,7 +157,7 @@ pub fn make_encoder_with(
     let mut last_err: Option<Error> = None;
     for imp in ranked {
         match (imp.make_encoder.unwrap())(params) {
-            Ok(e) => return Ok(e),
+            Ok(encoder) => return Ok((encoder, imp.caps.clone())),
             Err(e) => last_err = Some(e),
         }
     }

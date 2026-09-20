@@ -31,7 +31,9 @@ use oxideav_pixfmt::{convert as pixfmt_convert, ConvertOptions};
 use crate::dag::{codec_accepted_pixel_formats, Dag, DagNode, MuxTrack, ResolvedSelector};
 use crate::failure::{attribute, FailureStage, RunFailure, StageFailure, StageResult};
 use crate::schema::{is_reserved_sink, Job};
-use crate::selection::{make_decoder_with_selection, make_encoder_with, CodecPreferences};
+use crate::selection::{
+    make_decoder_with_selection, make_encoder_with_selection, CodecPreferences,
+};
 use crate::sinks::{open_file_write, FileSink, NullSink};
 use crate::staged;
 
@@ -83,6 +85,14 @@ impl SourcePump {
             Self::Demuxer(d) => d.streams(),
             Self::Packets(p) => p.streams(),
             Self::Frames { streams, .. } => streams.as_slice(),
+        }
+    }
+
+    fn shape(&self) -> PipelineSourceShape {
+        match self {
+            Self::Demuxer(_) => PipelineSourceShape::Demuxer,
+            Self::Packets(_) => PipelineSourceShape::PacketSource,
+            Self::Frames { .. } => PipelineSourceShape::FrameSource,
         }
     }
 }
@@ -1336,6 +1346,33 @@ pub(crate) enum StageSpec {
     },
 }
 
+/// Shape of the actual source pump opened for a routed track.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PipelineSourceShape {
+    Demuxer,
+    PacketSource,
+    FrameSource,
+}
+
+/// One successfully instantiated stage in a routed executor track.
+#[derive(Clone, Debug)]
+pub enum PipelineStageInfo {
+    Copy,
+    Decode { capabilities: CodecCapabilities },
+    Filter { name: String },
+    PixelFormatConvert { target: PixelFormat },
+    Encode { capabilities: CodecCapabilities },
+}
+
+/// Immutable runtime topology captured synchronously before worker threads start.
+#[derive(Clone, Debug)]
+pub struct PipelineTopology {
+    pub output_name: String,
+    pub packet_channel_capacity: usize,
+    pub frame_channel_capacity: usize,
+    pub tracks: Vec<PipelineTrackInfo>,
+}
+
 /// Immutable runtime identity for one routed executor track.
 ///
 /// Decoder capabilities are the registration that actually instantiated
@@ -1343,11 +1380,13 @@ pub(crate) enum StageSpec {
 #[derive(Clone, Debug)]
 pub struct PipelineTrackInfo {
     pub source_uri: String,
+    pub source_shape: PipelineSourceShape,
     pub source_stream: u32,
     pub media_type: MediaType,
     pub codec_id: CodecId,
     pub copy: bool,
     pub decoder: Option<CodecCapabilities>,
+    pub stages: Vec<PipelineStageInfo>,
 }
 
 /// One track's execution state: decoder + per-frame stage chain +
@@ -1378,6 +1417,7 @@ pub(crate) struct TrackRuntime {
     /// drains this vector to spawn one worker per stage.
     pub(crate) frame_stages: Vec<FrameStage>,
     pub(crate) encoder: Option<Box<dyn Encoder>>,
+    pub(crate) encoder_caps: Option<CodecCapabilities>,
     pub(crate) encoder_time_base: Option<TimeBase>,
     /// Additional output-stream descriptors synthesised for multi-port
     /// filters on this track (e.g. spectrogram's video-port).
@@ -1482,6 +1522,7 @@ impl TrackRuntime {
             decoder_caps: None,
             frame_stages: Vec::new(),
             encoder: None,
+            encoder_caps: None,
             encoder_time_base: None,
             extra_output_streams: Vec::new(),
             extra_output_port_counts: Vec::new(),
@@ -1508,14 +1549,39 @@ impl TrackRuntime {
         )
     }
 
-    fn pipeline_info(&self) -> PipelineTrackInfo {
+    fn pipeline_info(&self, source_shape: PipelineSourceShape) -> PipelineTrackInfo {
+        let stages = if self.copy {
+            vec![PipelineStageInfo::Copy]
+        } else {
+            self.stages
+                .iter()
+                .filter_map(|stage| match stage {
+                    StageSpec::Decode => self
+                        .decoder_caps
+                        .clone()
+                        .map(|capabilities| PipelineStageInfo::Decode { capabilities }),
+                    StageSpec::Filter { name, .. } => {
+                        Some(PipelineStageInfo::Filter { name: name.clone() })
+                    }
+                    StageSpec::Convert { target } => {
+                        Some(PipelineStageInfo::PixelFormatConvert { target: *target })
+                    }
+                    StageSpec::Encode { .. } => self
+                        .encoder_caps
+                        .clone()
+                        .map(|capabilities| PipelineStageInfo::Encode { capabilities }),
+                })
+                .collect()
+        };
         PipelineTrackInfo {
             source_uri: self.source_uri.clone(),
+            source_shape,
             source_stream: self.source_stream,
             media_type: self.kind,
             codec_id: self.input_params.codec_id.clone(),
             copy: self.copy,
             decoder: self.decoder_caps.clone(),
+            stages,
         }
     }
 
@@ -1627,7 +1693,8 @@ impl TrackRuntime {
                     if let Some(h) = params.get("height").and_then(|b| b.as_u64()) {
                         enc_params.height = Some(h as u32);
                     }
-                    let mut encoder = make_encoder_with(codecs, &enc_params, preferences)?;
+                    let (mut encoder, caps) =
+                        make_encoder_with_selection(codecs, &enc_params, preferences)?;
                     encoder.set_execution_context(ctx);
                     let out_params = encoder.output_params().clone();
                     running = out_params.clone();
@@ -1636,6 +1703,7 @@ impl TrackRuntime {
                         _ => self.input_time_base,
                     });
                     self.encoder = Some(encoder);
+                    self.encoder_caps = Some(caps);
                 }
             }
         }
@@ -2372,7 +2440,7 @@ pub struct ExecutorHandle {
     /// Output key of the (single) spawned output, for
     /// [`Self::stop_reporting`]'s failure attribution.
     output_name: String,
-    pipeline_tracks: Vec<PipelineTrackInfo>,
+    pipeline_topology: PipelineTopology,
 }
 
 impl ExecutorHandle {
@@ -2388,11 +2456,26 @@ impl ExecutorHandle {
         let max_queue_bytes = prep.max_queue_bytes;
         let discard_on_failure = prep.discard_on_failure;
         let output_name = prep.output_name.clone();
+        let (packet_channel_capacity, frame_channel_capacity) =
+            prep.channel_caps.unwrap_or_default().resolved();
         let pipeline_tracks = prep
             .pipelines
             .iter()
-            .map(TrackRuntime::pipeline_info)
+            .map(|pipeline| {
+                let source_shape = prep
+                    .sources_by_uri
+                    .get(&pipeline.source_uri)
+                    .expect("prepared pipeline source must exist")
+                    .shape();
+                pipeline.pipeline_info(source_shape)
+            })
             .collect();
+        let pipeline_topology = PipelineTopology {
+            output_name: prep.output_name.clone(),
+            packet_channel_capacity,
+            frame_channel_capacity,
+            tracks: pipeline_tracks,
+        };
         let join = std::thread::Builder::new()
             .name("oxideav-pipeline-exec".into())
             .spawn(move || {
@@ -2422,14 +2505,20 @@ impl ExecutorHandle {
             join: Some(join),
             finished,
             output_name,
-            pipeline_tracks,
+            pipeline_topology,
         }
     }
 
     /// Immutable runtime track identities captured after decoder
     /// selection and before worker threads start.
     pub fn pipeline_tracks(&self) -> &[PipelineTrackInfo] {
-        &self.pipeline_tracks
+        &self.pipeline_topology.tracks
+    }
+
+    /// Immutable executor topology captured after source resolution and stage
+    /// instantiation, before worker threads start.
+    pub fn pipeline_topology(&self) -> &PipelineTopology {
+        &self.pipeline_topology
     }
 
     /// Issue a seek to `(stream_idx, pts)` in `time_base` units. The
