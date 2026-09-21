@@ -507,6 +507,13 @@ impl AbortState {
         })
     }
 
+    pub(crate) fn new_with_token(cancellation: CancellationToken) -> Arc<Self> {
+        Arc::new(Self {
+            cancellation,
+            first_err: Mutex::new(None),
+        })
+    }
+
     pub(crate) fn is_aborted(&self) -> bool {
         self.cancellation.is_cancelled()
     }
@@ -2782,6 +2789,15 @@ mod tests {
         b.admit(200); // 200 >= 100 — would park
         abort.request_abort();
         b.wait_below_ceiling(&abort); // must return promptly, not hang
+    }
+
+    #[test]
+    fn abort_state_uses_caller_supplied_cancellation_token() {
+        let token = CancellationToken::new();
+        let abort = AbortState::new_with_token(token.clone());
+        assert!(!abort.is_aborted());
+        token.cancel();
+        assert!(abort.is_aborted());
     }
 
     struct FormatDiscoveringDecoder {

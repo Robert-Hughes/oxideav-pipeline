@@ -21,10 +21,11 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use oxideav_core::{
-    CodecCapabilities, CodecId, CodecParameters, CodecRegistry, Decoder, Demuxer, Encoder, Error,
-    ExecutionContext, FilterContext, FilterRegistry, Frame, FrameLease, FrameSource, MediaType,
-    Packet, PacketSource, PixelFormat, PortParams, PortSpec, Rational, ReadSeek, Result,
-    RuntimeContext, SampleFormat, SourceOutput, StreamFilter, StreamInfo, TimeBase,
+    CancellationToken, CodecCapabilities, CodecId, CodecParameters, CodecRegistry, Decoder,
+    Demuxer, Encoder, Error, ExecutionContext, FilterContext, FilterRegistry, Frame, FrameLease,
+    FrameSource, MediaType, Packet, PacketSource, PixelFormat, PortParams, PortSpec, Rational,
+    ReadSeek, Result, RuntimeContext, SampleFormat, SourceOutput, StreamFilter, StreamInfo,
+    TimeBase,
 };
 use oxideav_pixfmt::{convert as pixfmt_convert, ConvertOptions};
 
@@ -291,6 +292,8 @@ pub struct Executor<'a> {
     discard_failed_outputs: bool,
     /// EOF handling policy for spawned, seek-controlled playback graphs.
     eof_mode: EofMode,
+    /// Optional caller-supplied cancellation token shared with the spawned pipeline.
+    cancellation_token: Option<CancellationToken>,
     /// Optional factory for [`DagNode::Render3D`] nodes. When `None`,
     /// any `Render3D` node in the DAG fails source-shape resolution
     /// with an `Unsupported` error pointing at where to install the
@@ -321,6 +324,7 @@ impl<'a> Executor<'a> {
             max_queue_bytes: 0,
             discard_failed_outputs: false,
             eof_mode: EofMode::Finish,
+            cancellation_token: None,
             render_source_factory: None,
             codec_preferences: CodecPreferences::default(),
         }
@@ -344,6 +348,13 @@ impl<'a> Executor<'a> {
     /// seek can resume without rebuilding the executor. The default is `Finish`.
     pub fn with_eof_mode(mut self, mode: EofMode) -> Self {
         self.eof_mode = mode;
+        self
+    }
+
+    /// Share a caller-owned cancellation token with this executor run.
+    /// Cancelling it wakes pipeline blocking operations and aborts the graph.
+    pub fn with_cancellation_token(mut self, token: CancellationToken) -> Self {
+        self.cancellation_token = Some(token);
         self
     }
 
@@ -1348,6 +1359,7 @@ impl<'a> Executor<'a> {
             max_queue_bytes: self.max_queue_bytes,
             discard_on_failure: self.discard_failed_outputs,
             eof_mode: self.eof_mode,
+            cancellation_token: self.cancellation_token.clone(),
         })
     }
 
@@ -2484,6 +2496,7 @@ pub(crate) struct PreparedRun {
     /// of dropping it silently.
     pub(crate) discard_on_failure: bool,
     pub(crate) eof_mode: EofMode,
+    pub(crate) cancellation_token: Option<CancellationToken>,
 }
 
 /// Live handle to a background-running [`Executor`]. Returned by
@@ -2515,7 +2528,11 @@ pub struct ExecutorHandle {
 
 impl ExecutorHandle {
     pub(crate) fn start(prep: PreparedRun) -> Self {
-        let abort = crate::staged::AbortState::new();
+        let abort = prep
+            .cancellation_token
+            .clone()
+            .map(crate::staged::AbortState::new_with_token)
+            .unwrap_or_else(crate::staged::AbortState::new);
         let (seek_tx, seek_rx) = std::sync::mpsc::channel::<crate::staged::SeekCmd>();
         let (progress_tx, progress_rx) =
             std::sync::mpsc::sync_channel::<crate::staged::Progress>(64);
