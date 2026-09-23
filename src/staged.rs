@@ -418,22 +418,38 @@ impl QueueBudget {
         }
     }
 
-    /// Block the calling (demuxer) thread while the in-flight byte total
-    /// is at or above the ceiling. Returns early if `abort` is set so a
-    /// stop/quit doesn't strand the demuxer here. A short park (1 ms)
+    /// Block the source thread while the in-flight byte total is at or above
+    /// the ceiling. A seek must interrupt this wait: the queued packets are
+    /// only discarded after the source seeks successfully. Returns that
+    /// command to the caller so it can seek before reading another packet.
+    /// Also returns early if `abort` is set. A short park (1 ms)
     /// between polls keeps a stalled consumer from spinning a core; the
     /// release path is event-light enough that a condvar would be
     /// over-engineering for the ≤16-element queues this guards.
-    fn wait_below_ceiling(&self, abort: &AbortState) {
+    fn wait_below_ceiling(
+        &self,
+        abort: &AbortState,
+        seek_rx: Option<&Receiver<SeekCmd>>,
+    ) -> Option<SeekCmd> {
         if !self.enabled() {
-            return;
+            return None;
         }
         while self.in_flight.load(Ordering::SeqCst) >= self.max {
             if abort.is_aborted() {
-                return;
+                return None;
+            }
+            if let Some(rx) = seek_rx {
+                if let Ok(cmd) = rx.try_recv() {
+                    return Some(cmd);
+                }
             }
             thread::sleep(Duration::from_millis(1));
         }
+        None
+    }
+
+    fn at_ceiling(&self) -> bool {
+        self.enabled() && self.in_flight.load(Ordering::SeqCst) >= self.max
     }
 }
 
@@ -831,6 +847,7 @@ fn deliver_epoch_end(downstream: &mut FrameDownstream, abort: &Arc<AbortState>) 
 struct PacketRouteSender {
     tx: SyncSender<Msg<Packet>>,
     depth: Arc<AtomicUsize>,
+    pending_flush: Arc<AtomicU64>,
 }
 
 fn release_packet_depth(depth: &AtomicUsize) {
@@ -843,6 +860,7 @@ fn release_packet_depth(depth: &AtomicUsize) {
 struct PacketQueueAccounting {
     budget: Arc<QueueBudget>,
     depth: Arc<AtomicUsize>,
+    pending_flush: Arc<AtomicU64>,
 }
 
 impl PacketQueueAccounting {
@@ -850,9 +868,29 @@ impl PacketQueueAccounting {
         release_packet_depth(&self.depth);
         self.budget.release(packet.data.len() as u64);
     }
+
+    fn discard_until_flush(&self) -> bool {
+        self.pending_flush.load(Ordering::SeqCst) != 0
+    }
+
+    fn completed_barrier(&self, barrier: BarrierKind) {
+        if let BarrierKind::SeekFlush { generation, .. } = barrier {
+            let _ = self.pending_flush.compare_exchange(
+                u64::from(generation) + 1,
+                0,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
+        }
+    }
 }
 
 impl PacketRouteSender {
+    fn mark_flush(&self, generation: u32) {
+        self.pending_flush
+            .store(u64::from(generation) + 1, Ordering::SeqCst);
+    }
+
     fn send_data(&self, packet: Packet) -> std::result::Result<(), mpsc::SendError<Msg<Packet>>> {
         self.depth.fetch_add(1, Ordering::SeqCst);
         match self.tx.send(Msg::Data(packet)) {
@@ -1131,11 +1169,13 @@ pub(crate) fn run_pipelined_inner(
         } else {
             let (pkt_tx, pkt_rx) = mpsc::sync_channel::<Msg<Packet>>(pkt_cap);
             let packet_depth = packet_queue_depths[track_idx].clone();
+            let pending_flush = Arc::new(AtomicU64::new(0));
             routes_by_uri.entry(source_uri).or_default().push((
                 source_stream,
                 PacketRouteSender {
                     tx: pkt_tx,
                     depth: packet_depth.clone(),
+                    pending_flush: pending_flush.clone(),
                 },
             ));
 
@@ -1160,6 +1200,7 @@ pub(crate) fn run_pipelined_inner(
                             PacketQueueAccounting {
                                 budget: budget_c,
                                 depth: packet_depth,
+                                pending_flush,
                             },
                         )
                     },
@@ -1214,6 +1255,7 @@ pub(crate) fn run_pipelined_inner(
                         PacketQueueAccounting {
                             budget: budget_d,
                             depth: packet_depth,
+                            pending_flush,
                         },
                     )
                 },
@@ -1768,6 +1810,9 @@ where
         };
         let resumed = matches!(kind, BarrierKind::SeekFlush { .. });
         for (_, tx) in routes {
+            if let BarrierKind::SeekFlush { generation, .. } = kind {
+                tx.mark_flush(generation);
+            }
             if tx.send_control(Msg::Barrier(kind)).is_err() {
                 abort.request_abort();
                 return Ok(false);
@@ -1812,12 +1857,9 @@ fn run_demuxer_stage(
         if abort.is_aborted() {
             break;
         }
-        // Memory-bounded back-pressure: hold off reading the next packet
-        // while the in-flight packet bytes are at or above the ceiling.
-        // A no-op when no `max_queue_bytes` was set. This sits BEFORE the
-        // seek drain so a parked demuxer still wakes promptly on abort
-        // (the wait itself bails on the abort flag).
-        budget.wait_below_ceiling(&abort);
+        // A seek interrupts byte-budget back-pressure so its successful
+        // barrier can make queued packets eligible for fast discard.
+        let mut interrupted_seek = budget.wait_below_ceiling(&abort, seek_rx.as_ref());
         if abort.is_aborted() {
             break;
         }
@@ -1844,7 +1886,7 @@ fn run_demuxer_stage(
         // and the resulting barrier's `generation` are guaranteed to
         // match in lockstep regardless of how many seeks are queued.
         if let Some(rx) = &seek_rx {
-            while let Ok(cmd) = rx.try_recv() {
+            while let Some(cmd) = interrupted_seek.take().or_else(|| rx.try_recv().ok()) {
                 // Seek-owner duty: forward the command to every sibling
                 // routed source BEFORE handling it locally, so a
                 // multi-URI job re-anchors all of its sources on one
@@ -1871,12 +1913,18 @@ fn run_demuxer_stage(
                     },
                 };
                 for (_, tx) in &routes {
+                    if let BarrierKind::SeekFlush { generation, .. } = kind {
+                        tx.mark_flush(generation);
+                    }
                     if tx.send_control(Msg::Barrier(kind)).is_err() {
                         abort.request_abort();
                         return Ok(());
                     }
                 }
             }
+        }
+        if budget.at_ceiling() {
+            continue;
         }
         match dmx.next_packet() {
             Ok(pkt) => {
@@ -1986,12 +2034,12 @@ fn run_packet_source_stage(
         if abort.is_aborted() {
             break;
         }
-        budget.wait_below_ceiling(&abort);
+        let mut interrupted_seek = budget.wait_below_ceiling(&abort, seek_rx.as_ref());
         if abort.is_aborted() {
             break;
         }
         if let Some(rx) = &seek_rx {
-            while let Ok(cmd) = rx.try_recv() {
+            while let Some(cmd) = interrupted_seek.take().or_else(|| rx.try_recv().ok()) {
                 // Seek-owner duty (see `run_demuxer_stage`): a packet
                 // source can own the receiver in a mixed-shape multi-URI
                 // job, so siblings receive the same command first.
@@ -2011,12 +2059,18 @@ fn run_packet_source_stage(
                     },
                 };
                 for (_, tx) in &routes {
+                    if let BarrierKind::SeekFlush { generation, .. } = kind {
+                        tx.mark_flush(generation);
+                    }
                     if tx.send_control(Msg::Barrier(kind)).is_err() {
                         abort.request_abort();
                         return Ok(());
                     }
                 }
             }
+        }
+        if budget.at_ceiling() {
+            continue;
         }
         match src.next_packet() {
             Ok(pkt) => {
@@ -2136,6 +2190,9 @@ fn run_copy_stage(
         match rx.recv() {
             Ok(Msg::Data(pkt)) => {
                 packet_queue.release(&pkt);
+                if packet_queue.discard_until_flush() {
+                    continue;
+                }
                 match terminal.write_packet(pkt) {
                     Ok(DeliveryStatus::Delivered) => {
                         counters.packets_copied.fetch_add(1, Ordering::SeqCst);
@@ -2149,15 +2206,18 @@ fn run_copy_stage(
                 }
             }
             Ok(Msg::StreamUpdate(_)) => {}
-            Ok(Msg::Barrier(b)) => match terminal.barrier(b) {
-                Ok(DeliveryStatus::Delivered) => {}
-                Ok(DeliveryStatus::Closed) => {
-                    abort.request_abort();
-                    break;
+            Ok(Msg::Barrier(b)) => {
+                packet_queue.completed_barrier(b);
+                match terminal.barrier(b) {
+                    Ok(DeliveryStatus::Delivered) => {}
+                    Ok(DeliveryStatus::Closed) => {
+                        abort.request_abort();
+                        break;
+                    }
+                    Err(e) if e.is_cancelled() && abort.is_aborted() => break,
+                    Err(e) => return Err(e),
                 }
-                Err(e) if e.is_cancelled() && abort.is_aborted() => break,
-                Err(e) => return Err(e),
-            },
+            }
             Ok(Msg::EpochEnd) => match terminal.epoch_end() {
                 Ok(DeliveryStatus::Delivered) => {}
                 Ok(DeliveryStatus::Closed) => {
@@ -2191,6 +2251,9 @@ fn run_decode_stage(
         match rx.recv() {
             Ok(Msg::Data(pkt)) => {
                 packet_queue.release(&pkt);
+                if packet_queue.discard_until_flush() {
+                    continue;
+                }
                 if let Err(e) = decoder.send_packet(&pkt) {
                     if e.is_cancelled() && abort.is_aborted() {
                         break 'outer;
@@ -2254,6 +2317,7 @@ fn run_decode_stage(
             }
             Ok(Msg::StreamUpdate(_)) => {}
             Ok(Msg::Barrier(b)) => {
+                packet_queue.completed_barrier(b);
                 if matches!(b, BarrierKind::SeekFlush { .. }) {
                     decoder.reset()?;
                 }
@@ -2702,6 +2766,7 @@ mod tests {
         let route = PacketRouteSender {
             tx,
             depth: Arc::clone(&depth),
+            pending_flush: Arc::new(AtomicU64::new(0)),
         };
 
         route
@@ -2777,7 +2842,7 @@ mod tests {
         let abort = AbortState::new();
         let b = QueueBudget::new(4096);
         b.admit(100); // 100 < 4096
-        b.wait_below_ceiling(&abort); // must not hang
+        assert!(b.wait_below_ceiling(&abort, None).is_none()); // must not hang
     }
 
     #[test]
@@ -2788,7 +2853,28 @@ mod tests {
         let b = QueueBudget::new(100);
         b.admit(200); // 200 >= 100 — would park
         abort.request_abort();
-        b.wait_below_ceiling(&abort); // must return promptly, not hang
+        assert!(b.wait_below_ceiling(&abort, None).is_none()); // must return promptly
+    }
+
+    #[test]
+    fn queue_budget_wait_yields_pending_seek() {
+        let abort = AbortState::new();
+        let budget = QueueBudget::new(100);
+        budget.admit(100);
+        let (seek_tx, seek_rx) = mpsc::channel();
+        seek_tx
+            .send(SeekCmd {
+                stream_idx: 0,
+                pts: 42,
+                time_base: TimeBase::new(1, 1),
+                generation: 7,
+            })
+            .unwrap();
+        let command = budget
+            .wait_below_ceiling(&abort, Some(&seek_rx))
+            .expect("seek must interrupt a full byte budget");
+        assert_eq!(command.generation, 7);
+        assert_eq!(command.pts, 42);
     }
 
     #[test]
@@ -2804,6 +2890,7 @@ mod tests {
         codec_id: oxideav_core::CodecId,
         params: CodecParameters,
         pending: bool,
+        sent_packets: Arc<AtomicUsize>,
     }
 
     impl Decoder for FormatDiscoveringDecoder {
@@ -2816,6 +2903,7 @@ mod tests {
         }
 
         fn send_packet(&mut self, _packet: &Packet) -> Result<()> {
+            self.sent_packets.fetch_add(1, Ordering::SeqCst);
             self.params.sample_rate = Some(48_000);
             self.params.channels = Some(2);
             self.params.sample_format = Some(oxideav_core::SampleFormat::S16);
@@ -2838,6 +2926,11 @@ mod tests {
         fn flush(&mut self) -> Result<()> {
             Ok(())
         }
+
+        fn reset(&mut self) -> Result<()> {
+            self.pending = false;
+            Ok(())
+        }
     }
 
     #[test]
@@ -2847,6 +2940,7 @@ mod tests {
             codec_id: oxideav_core::CodecId::new("dynamic-audio"),
             params: params.clone(),
             pending: false,
+            sent_packets: Arc::new(AtomicUsize::new(0)),
         });
         let template = StreamInfo {
             index: 0,
@@ -2876,6 +2970,7 @@ mod tests {
             PacketQueueAccounting {
                 budget,
                 depth: Arc::new(AtomicUsize::new(0)),
+                pending_flush: Arc::new(AtomicU64::new(0)),
             },
         )
         .unwrap();
@@ -2891,6 +2986,104 @@ mod tests {
         );
         assert!(matches!(frame_rx.recv().unwrap(), Msg::Data(_)));
         assert!(matches!(frame_rx.recv().unwrap(), Msg::Eof));
+    }
+
+    #[test]
+    fn successful_seek_discards_queued_packets_before_decoder() {
+        let params = CodecParameters::audio(oxideav_core::CodecId::new("dynamic-audio"));
+        let sent_packets = Arc::new(AtomicUsize::new(0));
+        let decoder: Box<dyn Decoder> = Box::new(FormatDiscoveringDecoder {
+            codec_id: oxideav_core::CodecId::new("dynamic-audio"),
+            params,
+            pending: false,
+            sent_packets: sent_packets.clone(),
+        });
+        let (packet_tx, packet_rx) = mpsc::sync_channel(256);
+        let (frame_tx, frame_rx) = mpsc::sync_channel(4);
+        let depth = Arc::new(AtomicUsize::new(0));
+        let pending_flush = Arc::new(AtomicU64::new(0));
+        let budget = QueueBudget::new(256);
+        let route = PacketRouteSender {
+            tx: packet_tx,
+            depth: depth.clone(),
+            pending_flush: pending_flush.clone(),
+        };
+        for _ in 0..128 {
+            budget.admit(1);
+            route
+                .send_data(Packet::new(0, TimeBase::new(1, 90_000), vec![1]))
+                .unwrap();
+        }
+        route.mark_flush(1);
+        route
+            .send_control(Msg::Barrier(BarrierKind::SeekFlush {
+                generation: 1,
+                landed_pts: 90_000,
+                time_base: TimeBase::new(1, 90_000),
+            }))
+            .unwrap();
+        budget.admit(1);
+        route
+            .send_data(Packet::new(0, TimeBase::new(1, 90_000), vec![2]))
+            .unwrap();
+        route.send_control(Msg::Eof).unwrap();
+
+        run_decode_stage(
+            decoder,
+            packet_rx,
+            FrameDownstream::Channel(frame_tx),
+            None,
+            AbortState::new(),
+            Arc::new(PipelineCounters::default()),
+            PacketQueueAccounting {
+                budget: budget.clone(),
+                depth: depth.clone(),
+                pending_flush: pending_flush.clone(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(sent_packets.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            frame_rx.recv().unwrap(),
+            Msg::Barrier(BarrierKind::SeekFlush { generation: 1, .. })
+        ));
+        assert!(matches!(frame_rx.recv().unwrap(), Msg::Data(_)));
+        assert!(matches!(frame_rx.recv().unwrap(), Msg::Eof));
+        assert_eq!(depth.load(Ordering::SeqCst), 0);
+        assert_eq!(budget.in_flight(), 0);
+        assert_eq!(pending_flush.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn rejected_seek_does_not_discard_packet_backlog() {
+        let pending_flush = Arc::new(AtomicU64::new(0));
+        let route = PacketRouteSender {
+            tx: mpsc::sync_channel(1).0,
+            depth: Arc::new(AtomicUsize::new(0)),
+            pending_flush: pending_flush.clone(),
+        };
+        let accounting = PacketQueueAccounting {
+            budget: QueueBudget::new(0),
+            depth: Arc::new(AtomicUsize::new(0)),
+            pending_flush,
+        };
+        accounting.completed_barrier(BarrierKind::SeekRejected { generation: 1 });
+        assert!(!accounting.discard_until_flush());
+        route.mark_flush(2);
+        accounting.completed_barrier(BarrierKind::SeekRejected { generation: 3 });
+        accounting.completed_barrier(BarrierKind::SeekFlush {
+            generation: 1,
+            landed_pts: 0,
+            time_base: TimeBase::new(1, 1),
+        });
+        assert!(accounting.discard_until_flush());
+        accounting.completed_barrier(BarrierKind::SeekFlush {
+            generation: 2,
+            landed_pts: 0,
+            time_base: TimeBase::new(1, 1),
+        });
+        assert!(!accounting.discard_until_flush());
     }
 
     struct CancellationBlockingDecoder {
@@ -2956,6 +3149,7 @@ mod tests {
                 PacketQueueAccounting {
                     budget,
                     depth: Arc::new(AtomicUsize::new(0)),
+                    pending_flush: Arc::new(AtomicU64::new(0)),
                 },
             );
             done_tx.send(result).expect("report worker result");
