@@ -56,6 +56,94 @@ impl JobSink for ChannelSink {
     }
 }
 
+/// Independent packet sources both call their only stream 0, but use different clocks.
+struct ClockPackets {
+    streams: Vec<StreamInfo>,
+    next: i64,
+}
+
+impl oxideav_core::PacketSource for ClockPackets {
+    fn streams(&self) -> &[StreamInfo] {
+        &self.streams
+    }
+    fn supports_seek(&self) -> bool {
+        true
+    }
+    fn next_packet(&mut self) -> Result<Packet> {
+        if self.next >= 600 {
+            return Err(oxideav_core::Error::Eof);
+        }
+        let stream = &self.streams[0];
+        let pts = self.next * stream.time_base.den() / 10;
+        self.next += 1;
+        Ok(Packet::new(0, stream.time_base, vec![0]).with_pts(pts))
+    }
+    fn seek_to(&mut self, stream: u32, pts: i64) -> Result<i64> {
+        assert_eq!(stream, 0);
+        let rate = self.streams[0].time_base.den();
+        self.next = (pts * 10 / rate).clamp(0, 599);
+        Ok(self.next * rate / 10)
+    }
+}
+
+fn open_clock_packets(uri: &str) -> Result<Box<dyn oxideav_core::PacketSource>> {
+    let rate: i64 = uri.strip_prefix("clock://").unwrap().parse().unwrap();
+    Ok(Box::new(ClockPackets {
+        streams: vec![StreamInfo {
+            index: 0,
+            time_base: TimeBase::new(1, rate),
+            start_time: Some(0),
+            duration: Some(60 * rate),
+            params: oxideav_core::CodecParameters::audio(oxideav_core::CodecId::new("clock")),
+        }],
+        next: 0,
+    }))
+}
+
+#[test]
+fn packet_sources_with_overlapping_stream_indices_seek_in_their_own_time_bases() {
+    let mut ctx = oxideav_core::RuntimeContext::new();
+    ctx.sources.register_packets("clock", open_clock_packets);
+    let job = Job::from_json(
+        r#"{"out.fixture":{"audio":[
+        {"from":"clock://48000","copy":true},
+        {"from":"clock://90000","copy":true}
+    ]}}"#,
+    )
+    .unwrap();
+    let (tx, rx) = mpsc::sync_channel(4096);
+    let handle = Executor::new(&job, &ctx)
+        .with_sink_override("out.fixture", Box::new(ChannelSink { tx }))
+        .with_eof_mode(oxideav_pipeline::EofMode::WaitForSeek)
+        .spawn()
+        .unwrap();
+    wait_first_payload(&rx, Instant::now() + Duration::from_secs(5));
+    for seconds in [30, 5] {
+        let generation = handle
+            .seek_with_generation(0, seconds * 90_000, TimeBase::new(1, 90_000))
+            .unwrap();
+        let barriers = collect_barriers(&rx, 2, Instant::now() + Duration::from_secs(5));
+        assert_eq!(barriers.len(), 2, "every source must answer");
+        let mut rates = Vec::new();
+        for barrier in barriers {
+            let BarrierKind::SeekFlush {
+                generation: got,
+                landed_pts,
+                time_base,
+            } = barrier
+            else {
+                panic!("seek rejected")
+            };
+            assert_eq!(got, generation);
+            assert_eq!(landed_pts, seconds * time_base.den());
+            rates.push(time_base.den());
+        }
+        rates.sort();
+        assert_eq!(rates, [48_000, 90_000]);
+    }
+    handle.stop().unwrap();
+}
+
 /// Collect barrier events until `n` arrive or the deadline passes.
 fn collect_barriers(rx: &Receiver<SinkEvent>, n: usize, deadline: Instant) -> Vec<BarrierKind> {
     let mut got = Vec::new();

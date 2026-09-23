@@ -1986,18 +1986,15 @@ fn run_demuxer_stage(
 /// Resolve which stream of THIS source a [`SeekCmd`] should move, and
 /// to what pts.
 ///
-/// * The command's `stream_idx` is one of this source's routed streams
-///   → primary target: seek it with the command's pts verbatim
-///   (the historical single-source behaviour).
-/// * Otherwise the primary target lives on a sibling source of a
-///   multi-URI job, and this source is being re-anchored to the same
-///   presentation instant: retarget at the FIRST routed stream, with
-///   the pts rescaled from the command's time base into that stream's
-///   own — the returned time base is the one the eventual
-///   `SeekFlush::landed_pts` is expressed in, keeping the barrier's
-///   "landed pts with matching time_base" contract intact. When the
-///   stream's info is unavailable the pts passes through unscaled
-///   (best effort; the demuxer clamps).
+/// Prefer a matching routed stream index, otherwise use the first route.
+/// Always rescale from the command's time base into the selected stream's
+/// own: indices are source-local, so two sources can both route stream 0
+/// while using different clocks. A matching index does not imply matching
+/// time bases. The returned time base is the one the eventual
+/// `SeekFlush::landed_pts` is expressed in, keeping the barrier's
+/// "landed pts with matching time_base" contract intact. When the
+/// stream's info is unavailable the pts passes through unscaled
+/// (best effort; the demuxer clamps).
 ///
 /// The generic `T` is the route payload (a channel sender at the call
 /// site); only the stream index half of each route matters here.
@@ -2006,10 +2003,11 @@ fn resolve_seek_target<T>(
     streams: &[StreamInfo],
     cmd: &SeekCmd,
 ) -> (u32, i64, TimeBase) {
-    if routes.iter().any(|(s, _)| *s == cmd.stream_idx) {
-        return (cmd.stream_idx, cmd.pts, cmd.time_base);
-    }
-    let dst = routes.first().map(|(s, _)| *s).unwrap_or(cmd.stream_idx);
+    let dst = if routes.iter().any(|(s, _)| *s == cmd.stream_idx) {
+        cmd.stream_idx
+    } else {
+        routes.first().map(|(s, _)| *s).unwrap_or(cmd.stream_idx)
+    };
     match streams.iter().find(|s| s.index == dst) {
         Some(info) => (
             dst,
@@ -2689,6 +2687,20 @@ mod tests {
         assert_eq!(s, 1);
         assert_eq!(p, 2_700_000);
         assert_eq!(tb, TimeBase::new(1, 90_000));
+    }
+
+    #[test]
+    fn seek_target_matching_source_local_index_still_rescales() {
+        let routes = [(0, ())];
+        let c = cmd(0, 2_700_000, TimeBase::new(1, 90_000));
+        for rate in [44_100, 48_000, 90_000] {
+            let tb = TimeBase::new(1, rate);
+            let streams = [stream_info(0, tb)];
+            assert_eq!(
+                resolve_seek_target(&routes, &streams, &c),
+                (0, 30 * rate, tb)
+            );
+        }
     }
 
     #[test]

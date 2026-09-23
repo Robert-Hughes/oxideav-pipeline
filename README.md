@@ -329,7 +329,9 @@ every track observes exactly one barrier per generation. A command
 addressing a stream a source doesn't route still seeks that source:
 it retargets at its first routed stream with the pts rescaled into
 that stream's time base, landing every source on the same presentation
-instant. Historically only the first routed source received the seek
+instant. Matching stream indices also rescale: indices are local to each
+source, so audio and video can both be stream zero with different time bases.
+Historically only the first routed source received the seek
 and the others silently kept their old position. See
 `tests/seek_multi_source.rs` plus the `resolve_seek_target` unit
 tests.
